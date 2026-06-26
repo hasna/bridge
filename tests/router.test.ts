@@ -39,6 +39,24 @@ test("rejects messages outside a Telegram channel allowlist", () => {
   expect(routes).toEqual([]);
 });
 
+test("rejects messages from disabled channels", () => {
+  const disabledConfig: BridgeConfig = {
+    ...config,
+    channels: {
+      ...config.channels,
+      tg: { id: "tg", kind: "telegram", botTokenEnv: "TG_TOKEN", enabled: false, allowedChatIds: ["1"] },
+    },
+  };
+  const routes = matchingRoutes(disabledConfig, {
+    id: "m",
+    channelId: "tg",
+    chatId: "1",
+    text: "hi bridge",
+    receivedAt: new Date(0).toISOString(),
+  });
+  expect(routes).toEqual([]);
+});
+
 test("rejects Telegram channels without allowlist or explicit allow-all", () => {
   const openConfig: BridgeConfig = {
     ...config,
@@ -151,6 +169,44 @@ test("does not send Telegram responseChannel messages outside response allowlist
     id: "m",
     channelId: "local",
     chatId: "2",
+    text: "hi bridge",
+    receivedAt: new Date(0).toISOString(),
+  }, {
+    run: async (_config, agentId): Promise<AgentRunResult> => ({
+      agentId,
+      command: ["fake"],
+      exitCode: 0,
+      stdout: "done",
+      stderr: "",
+      timedOut: false,
+    }),
+    sendTelegram: async () => {
+      sent++;
+      return { ok: true };
+    },
+  });
+
+  expect(results).toHaveLength(1);
+  expect(results[0]?.deliveredResponse).toBe(false);
+  expect(sent).toBe(0);
+});
+
+test("does not deliver responses through disabled channels", async () => {
+  let sent = 0;
+  const disabledResponseConfig: BridgeConfig = {
+    ...config,
+    channels: {
+      local: { id: "local", kind: "console", enabled: true },
+      tg: { id: "tg", kind: "telegram", botTokenEnv: "TG_TOKEN", enabled: false, allowedChatIds: ["1"] },
+    },
+    routes: [
+      { id: "local-telegram", fromChannel: "local", toAgent: "echo", responseChannel: "tg", enabled: true },
+    ],
+  };
+  const results = await routeMessage(disabledResponseConfig, {
+    id: "m",
+    channelId: "local",
+    chatId: "1",
     text: "hi bridge",
     receivedAt: new Date(0).toISOString(),
   }, {

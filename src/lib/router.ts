@@ -10,6 +10,7 @@ export interface RouteMessageOptions {
 
 export function matchingRoutes(config: BridgeConfig, message: BridgeMessage): RouteConfig[] {
   const channel = config.channels[message.channelId];
+  if (!channel || channel.enabled === false) return [];
   if (channel?.kind === "telegram" && !telegramChatAllowed(channel, message.chatId)) {
     return [];
   }
@@ -41,6 +42,11 @@ export async function routeMessage(
     let deliveredResponse = false;
     const channel = responseChannel(config, route, message);
     const responseText = agent.stdout.trim();
+
+    if (channel?.enabled === false) {
+      results.push({ route, agent, deliveredResponse });
+      continue;
+    }
 
     if (responseText && channel?.kind === "telegram" && message.chatId) {
       if (!telegramChatAllowed(channel, message.chatId)) {

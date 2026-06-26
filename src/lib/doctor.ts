@@ -1,7 +1,24 @@
-import { access } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { defaultConfigPath } from "./paths.js";
 import { loadConfig } from "./config.js";
+import { defaultStatePath } from "./state.js";
 import type { DoctorCheck, DoctorReport } from "../types.js";
+
+function isNotFound(err: unknown): boolean {
+  return Boolean(err && typeof err === "object" && "code" in err && err.code === "ENOENT");
+}
+
+async function privateFileCheck(name: string, path: string): Promise<DoctorCheck> {
+  try {
+    const info = await stat(path);
+    const mode = info.mode & 0o777;
+    const ok = (mode & 0o077) === 0;
+    return { name, ok, detail: `${path} mode=${mode.toString(8)}` };
+  } catch (err) {
+    if (isNotFound(err)) return { name, ok: true, detail: `not created yet: ${path}` };
+    return { name, ok: false, detail: `${path}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
 
 async function commandExists(command: string): Promise<boolean> {
   const proc = Bun.spawn(["sh", "-lc", `command -v ${command} >/dev/null 2>&1`], {
@@ -11,16 +28,12 @@ async function commandExists(command: string): Promise<boolean> {
   return (await proc.exited) === 0;
 }
 
-export async function doctor(configPath = defaultConfigPath()): Promise<DoctorReport> {
+export async function doctor(configPath = defaultConfigPath(), statePath = defaultStatePath()): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
   let config = await loadConfig(configPath);
 
-  try {
-    await access(configPath);
-    checks.push({ name: "config", ok: true, detail: configPath });
-  } catch {
-    checks.push({ name: "config", ok: true, detail: `not created yet: ${configPath}` });
-  }
+  checks.push(await privateFileCheck("config", configPath));
+  checks.push(await privateFileCheck("state", statePath));
 
   for (const command of ["bridge", "codewith", "claude", "aicopilot"]) {
     checks.push({

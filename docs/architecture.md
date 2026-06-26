@@ -43,5 +43,9 @@ Telegram channels fail closed unless `allowedChatIds` are configured or
 before route matching. Routes can also add narrower `match.chatIds` filters, but
 they cannot expand beyond the channel allowlist.
 
+Disabled channels do not match inbound routes and do not deliver responses.
+MCP config inspection redacts profile and agent environment values so local
+secrets are not exposed through `bridge_config`.
+
 Long-poll offsets are persisted in a private state file so process restarts do
 not replay already-seen updates and re-run agents.

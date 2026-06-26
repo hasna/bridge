@@ -1,6 +1,6 @@
 {
   "name": "@hasna/bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Agent messaging bridge for Telegram and other channels",
   "type": "module",
   "main": "dist/index.js",
@@ -29,7 +29,7 @@
     "dev:cli": "bun run src/cli/index.ts",
     "dev:mcp": "bun run src/mcp/index.ts",
     "prepublishOnly": "bun run build",
-    "postinstall": "bun -e \"const fs=require('node:fs');const path=require('node:path');const dir=path.join(process.env.HOME||process.cwd(),'.hasna','bridge');fs.mkdirSync(dir,{recursive:true,mode:0o700});try{fs.chmodSync(dir,0o700)}catch{}\""
+    "postinstall": "node -e \"const fs=require('node:fs');const path=require('node:path');const dir=path.join(process.env.HOME||process.cwd(),'.hasna','bridge');fs.mkdirSync(dir,{recursive:true,mode:0o700});try{fs.chmodSync(dir,0o700)}catch{}\""
   },
   "keywords": [
     "bridge",

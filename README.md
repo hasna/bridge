@@ -89,6 +89,7 @@ Override with `BRIDGE_HOME` or `BRIDGE_CONFIG`.
 Telegram bot tokens should stay in environment variables; config stores the env
 var name, not the token value. Telegram channels fail closed unless
 `allowedChatIds` are set or `allowAllChats` is explicitly enabled.
-Channel-level `allowedChatIds` are enforced before route matching, and long-poll
-offsets are persisted in `~/.hasna/bridge/state.json` so restarts do not replay
-already-seen updates.
+Disabled channels do not match or deliver routes. Channel-level `allowedChatIds`
+are enforced before route matching, and long-poll offsets are persisted in
+`~/.hasna/bridge/state.json` so restarts do not replay already-seen updates.
+MCP config inspection redacts profile and agent environment values.

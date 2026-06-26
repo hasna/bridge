@@ -4,6 +4,8 @@ import { z } from "zod";
 import { CONFIG_VERSION, type AgentConfig, type BridgeConfig, type ChannelConfig, type ProfileConfig, type RouteConfig } from "../types.js";
 import { defaultConfigPath } from "./paths.js";
 
+const REDACTED_VALUE = "[redacted]";
+
 const channelSchema = z.discriminatedUnion("kind", [
   z.object({
     id: z.string().min(1),
@@ -97,6 +99,32 @@ export function emptyConfig(): BridgeConfig {
 export function parseConfig(value: unknown): BridgeConfig {
   const parsed = configSchema.parse(value);
   return parsed as BridgeConfig;
+}
+
+function redactEnv(env: Record<string, string> | undefined): Record<string, string> | undefined {
+  if (!env) return undefined;
+  return Object.fromEntries(Object.keys(env).map((key) => [key, REDACTED_VALUE]));
+}
+
+function redactEnvRecord<T extends { env?: Record<string, string> }>(items: Record<string, T>): Record<string, T> {
+  return Object.fromEntries(Object.entries(items).map(([id, item]) => {
+    const clone = { ...item };
+    if (item.env) clone.env = redactEnv(item.env);
+    return [id, clone];
+  }));
+}
+
+export function redactConfig(config: BridgeConfig): BridgeConfig {
+  return {
+    ...config,
+    channels: Object.fromEntries(Object.entries(config.channels).map(([id, channel]) => [id, { ...channel }])),
+    profiles: redactEnvRecord(config.profiles),
+    agents: redactEnvRecord(config.agents),
+    routes: config.routes.map((route) => ({
+      ...route,
+      match: route.match ? { ...route.match, chatIds: route.match.chatIds ? [...route.match.chatIds] : undefined } : undefined,
+    })),
+  };
 }
 
 export async function loadConfig(configPath = defaultConfigPath()): Promise<BridgeConfig> {

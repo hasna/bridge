@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "channels": {
+    "telegram-main": {
+      "id": "telegram-main",
+      "kind": "telegram",
+      "enabled": true,
+      "botTokenEnv": "TELEGRAM_BOT_TOKEN",
+      "allowedChatIds": ["123456789"],
+      "allowAllChats": false
+    }
+  },
+  "profiles": {
+    "codewith-account001": {
+      "id": "codewith-account001",
+      "agentKind": "codewith",
+      "authProfile": "account001",
+      "cwd": "/Users/hasna"
+    },
+    "claude-account001": {
+      "id": "claude-account001",
+      "agentKind": "claude",
+      "home": "/Users/hasna/.hasna/accounts/profiles/claude/account001"
+    },
+    "aicopilot-main": {
+      "id": "aicopilot-main",
+      "agentKind": "aicopilot",
+      "cwd": "/Users/hasna"
+    }
+  },
+  "agents": {
+    "codewith": {
+      "id": "codewith",
+      "kind": "codewith",
+      "profileId": "codewith-account001"
+    }
+  },
+  "routes": [
+    {
+      "id": "telegram-codewith",
+      "fromChannel": "telegram-main",
+      "toAgent": "codewith",
+      "enabled": true,
+      "match": {
+        "chatIds": ["123456789"]
+      }
+    }
+  ]
+}

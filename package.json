@@ -1,0 +1,71 @@
+{
+  "name": "@hasna/bridge",
+  "version": "0.1.0",
+  "description": "Agent messaging bridge for Telegram and other channels",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "bridge": "dist/cli/index.js",
+    "bridge-mcp": "dist/mcp/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "docs",
+    "examples",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && bun build src/cli/index.ts --outdir dist/cli --target bun --external @modelcontextprotocol/sdk && bun build src/mcp/index.ts --outdir dist/mcp --target bun --external @modelcontextprotocol/sdk && bun build src/index.ts --outdir dist --target bun && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "dev:cli": "bun run src/cli/index.ts",
+    "dev:mcp": "bun run src/mcp/index.ts",
+    "prepublishOnly": "bun run build",
+    "postinstall": "bun -e \"const fs=require('node:fs');const path=require('node:path');const dir=path.join(process.env.HOME||process.cwd(),'.hasna','bridge');fs.mkdirSync(dir,{recursive:true,mode:0o700});try{fs.chmodSync(dir,0o700)}catch{}\""
+  },
+  "keywords": [
+    "bridge",
+    "telegram",
+    "messaging",
+    "agents",
+    "codewith",
+    "claude",
+    "aicopilot",
+    "mcp",
+    "cli"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hasna/bridge.git"
+  },
+  "homepage": "https://github.com/hasna/bridge",
+  "bugs": {
+    "url": "https://github.com/hasna/bridge/issues"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "author": "Andrei Hasna <andrei@hasna.com>",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "commander": "^13.1.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.4",
+    "typescript": "^5.7.3"
+  }
+}

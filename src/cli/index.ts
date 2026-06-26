@@ -11,10 +11,21 @@ import {
   upsertChannel,
   upsertProfile,
   upsertRoute,
+  daemonLogs,
+  daemonPaths,
+  daemonStatus,
   doctor,
+  installDaemon,
+  restartInstalledDaemon,
+  restartProcessDaemon,
   routeMessage,
   runAgent,
   sendTelegramMessage,
+  startInstalledDaemon,
+  startProcessDaemon,
+  stopInstalledDaemon,
+  stopProcessDaemon,
+  uninstallDaemon,
   getTelegramUpdates,
   telegramToken,
   telegramUpdateToMessage,
@@ -55,6 +66,12 @@ function splitCsv(value: string | undefined): string[] | undefined {
   return value?.split(",").map((item) => item.trim()).filter(Boolean);
 }
 
+function parseNonNegativeInt(value: string | undefined, name: string): number {
+  const raw = value || "0";
+  if (!/^\d+$/.test(raw)) throw new Error(`${name} must be a non-negative integer`);
+  return Number.parseInt(raw, 10);
+}
+
 function printList(items: Record<string, unknown> | unknown[]): void {
   const rows = Array.isArray(items) ? items : Object.values(items);
   if (!rows.length) {
@@ -69,30 +86,48 @@ async function runServe(options: { once?: boolean; interval?: string; json?: boo
   const telegramChannels = Object.values(config.channels).filter(
     (channel): channel is TelegramChannelConfig => channel.kind === "telegram" && channel.enabled !== false,
   );
-  const intervalMs = Number.parseInt(options.interval || "1000", 10);
-  if (!Number.isInteger(intervalMs) || intervalMs < 0) throw new Error("--interval must be a non-negative integer");
+  const intervalMs = parseNonNegativeInt(options.interval || "1000", "--interval");
   if (!telegramChannels.length) throw new Error("No enabled Telegram channels configured");
 
   const statePath = options.state || defaultStatePath();
   const state = await loadState(statePath);
-  while (true) {
+  const errorCounts = new Map<string, number>();
+  let stopping = false;
+  const stop = () => {
+    stopping = true;
+  };
+  process.once("SIGTERM", stop);
+  process.once("SIGINT", stop);
+  while (!stopping) {
     for (const channel of telegramChannels) {
-      const updates = await getTelegramUpdates(telegramToken(channel), {
-        offset: state.telegramOffsets[channel.id],
-        timeoutSeconds: channel.pollTimeoutSeconds || 20,
-      });
-      for (const update of updates) {
-        state.telegramOffsets[channel.id] = update.update_id + 1;
-        await saveState(state, statePath);
-        const message = telegramUpdateToMessage(channel.id, update);
-        if (!message) continue;
-        const results = await routeMessage(config, message, { writeConsole: options.json ? false : undefined });
-        if (options.json) asJson({ message, results });
+      try {
+        const updates = await getTelegramUpdates(telegramToken(channel), {
+          offset: state.telegramOffsets[channel.id],
+          timeoutSeconds: channel.pollTimeoutSeconds || 20,
+        });
+        errorCounts.delete(channel.id);
+        for (const update of updates) {
+          state.telegramOffsets[channel.id] = update.update_id + 1;
+          await saveState(state, statePath);
+          const message = telegramUpdateToMessage(channel.id, update);
+          if (!message) continue;
+          const results = await routeMessage(config, message, { writeConsole: options.json ? false : undefined });
+          if (options.json) asJson({ message, results });
+        }
+      } catch (err) {
+        if (options.once) throw err;
+        const count = (errorCounts.get(channel.id) || 0) + 1;
+        errorCounts.set(channel.id, count);
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[bridge] ${channel.id} poll failed (${count}): ${message}`);
+        await Bun.sleep(Math.min(30_000, Math.max(1000, intervalMs * Math.min(count, 30))));
       }
     }
     if (options.once) break;
     await Bun.sleep(intervalMs);
   }
+  process.removeListener("SIGTERM", stop);
+  process.removeListener("SIGINT", stop);
 }
 
 const program = new Command();
@@ -337,6 +372,153 @@ program
   .option("--state <path>", "state path", defaultStatePath())
   .option("--json", "emit routed message JSON")
   .action(runServe);
+
+const daemon = program.command("daemon").description("Manage the bridge background daemon");
+
+daemon
+  .command("status")
+  .description("Show daemon status")
+  .option("--supervisor <type>", "process, launchd, systemd, or auto", "process")
+  .option("--daemon-dir <path>", "daemon metadata/log directory")
+  .option("--json", "output JSON")
+  .action(async (options) => {
+    const status = await daemonStatus({ supervisor: options.supervisor, daemonDir: options.daemonDir });
+    if (options.json) asJson(status);
+    else {
+      console.log(`${status.running ? "running" : status.stale ? "stale" : "stopped"} ${status.supervisor}${status.pid ? ` pid=${status.pid}` : ""}`);
+      console.log(`daemonDir=${status.paths.dir}`);
+      console.log(`stdout=${status.paths.stdoutLog}`);
+      console.log(`stderr=${status.paths.stderrLog}`);
+      if (status.telegramApiBase.error) {
+        console.log(`telegramApiBaseError=${status.telegramApiBase.error}`);
+      } else if (status.telegramApiBase.overridden) {
+        console.log(`telegramApiBase=${status.telegramApiBase.origin}${status.telegramApiBase.pathname}`);
+      }
+    }
+  });
+
+daemon
+  .command("start")
+  .description("Start bridge serve in the background")
+  .option("--supervisor <type>", "process, launchd, systemd, or auto", "process")
+  .option("--daemon-dir <path>", "daemon metadata/log directory")
+  .option("--interval <ms>", "delay between polls", "1000")
+  .option("-c, --config <path>", "config path", defaultConfigPath())
+  .option("--state <path>", "state path", defaultStatePath())
+  .option("--serve-json", "emit routed message JSON to daemon stdout log")
+  .option("--json", "output JSON")
+  .action(async (options) => {
+    const intervalMs = parseNonNegativeInt(options.interval, "--interval");
+    const supervisor = options.supervisor;
+    const result = supervisor === "process"
+      ? await startProcessDaemon({ daemonDir: options.daemonDir, configPath: options.config, statePath: options.state, intervalMs, serveJson: options.serveJson })
+      : await startInstalledDaemon({ supervisor, daemonDir: options.daemonDir, configPath: options.config, statePath: options.state, intervalMs, serveJson: options.serveJson });
+    options.json ? asJson(result) : console.log("started");
+  });
+
+daemon
+  .command("stop")
+  .description("Stop the bridge daemon")
+  .option("--supervisor <type>", "process, launchd, systemd, or auto", "process")
+  .option("--daemon-dir <path>", "daemon metadata/log directory")
+  .option("--timeout-ms <ms>", "graceful stop timeout", "5000")
+  .option("--force", "force kill after timeout")
+  .option("--json", "output JSON")
+  .action(async (options) => {
+    const timeoutMs = parseNonNegativeInt(options.timeoutMs, "--timeout-ms");
+    const result = options.supervisor === "process"
+      ? await stopProcessDaemon({ daemonDir: options.daemonDir, timeoutMs, force: options.force })
+      : await stopInstalledDaemon({ supervisor: options.supervisor, daemonDir: options.daemonDir, timeoutMs, force: options.force });
+    options.json ? asJson(result || { stopped: true }) : console.log("stopped");
+  });
+
+daemon
+  .command("restart")
+  .description("Restart the bridge daemon")
+  .option("--supervisor <type>", "process, launchd, systemd, or auto", "process")
+  .option("--daemon-dir <path>", "daemon metadata/log directory")
+  .option("--interval <ms>", "delay between polls")
+  .option("-c, --config <path>", "config path")
+  .option("--state <path>", "state path")
+  .option("--serve-json", "emit routed message JSON to daemon stdout log")
+  .option("--timeout-ms <ms>", "graceful stop timeout", "5000")
+  .option("--force", "force kill after timeout")
+  .option("--json", "output JSON")
+  .action(async (options) => {
+    const restartOptions = {
+      supervisor: options.supervisor,
+      daemonDir: options.daemonDir,
+      configPath: options.config,
+      statePath: options.state,
+      intervalMs: options.interval ? parseNonNegativeInt(options.interval, "--interval") : undefined,
+      serveJson: options.serveJson,
+      timeoutMs: parseNonNegativeInt(options.timeoutMs, "--timeout-ms"),
+      force: options.force,
+    };
+    const result = options.supervisor === "process"
+      ? await restartProcessDaemon(restartOptions)
+      : await restartInstalledDaemon(restartOptions);
+    options.json ? asJson(result) : console.log("restarted");
+  });
+
+daemon
+  .command("logs")
+  .description("Print daemon logs")
+  .option("--daemon-dir <path>", "daemon metadata/log directory")
+  .option("--lines <n>", "number of lines", "100")
+  .option("--follow", "follow logs")
+  .option("--json", "output JSON")
+  .action(async (options) => {
+    const lines = parseNonNegativeInt(options.lines, "--lines") || 100;
+    if (options.follow) {
+      const paths = daemonPaths(options.daemonDir);
+      const tail = Bun.spawn(["tail", "-n", String(lines), "-f", paths.stdoutLog, paths.stderrLog], {
+        stdout: "inherit",
+        stderr: "inherit",
+      });
+      await tail.exited;
+      return;
+    }
+    const logs = await daemonLogs({ daemonDir: options.daemonDir, lines });
+    if (options.json) asJson(logs);
+    else {
+      if (logs.stdout) console.log(logs.stdout);
+      if (logs.stderr) console.error(logs.stderr);
+    }
+  });
+
+daemon
+  .command("install")
+  .description("Write launchd or systemd user supervisor files")
+  .option("--supervisor <type>", "launchd, systemd, or auto", "auto")
+  .option("--daemon-dir <path>", "daemon metadata/log directory")
+  .option("--interval <ms>", "delay between polls", "1000")
+  .option("-c, --config <path>", "config path", defaultConfigPath())
+  .option("--state <path>", "state path", defaultStatePath())
+  .option("--serve-json", "emit routed message JSON to daemon stdout log")
+  .option("--json", "output JSON")
+  .action(async (options) => {
+    const result = await installDaemon({
+      supervisor: options.supervisor,
+      daemonDir: options.daemonDir,
+      configPath: options.config,
+      statePath: options.state,
+      intervalMs: parseNonNegativeInt(options.interval, "--interval"),
+      serveJson: options.serveJson,
+    });
+    options.json ? asJson(result) : console.log(`installed ${result.supervisor}: ${result.path}`);
+  });
+
+daemon
+  .command("uninstall")
+  .description("Remove launchd/systemd supervisor files or process metadata")
+  .option("--supervisor <type>", "process, launchd, systemd, or auto", "auto")
+  .option("--daemon-dir <path>", "daemon metadata/log directory")
+  .option("--json", "output JSON")
+  .action(async (options) => {
+    const result = await uninstallDaemon({ supervisor: options.supervisor, daemonDir: options.daemonDir });
+    options.json ? asJson(result) : console.log(`removed ${result.removed.join(", ")}`);
+  });
 
 program
   .command("route-message")

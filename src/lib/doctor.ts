@@ -2,6 +2,8 @@ import { stat } from "node:fs/promises";
 import { defaultConfigPath } from "./paths.js";
 import { loadConfig } from "./config.js";
 import { defaultStatePath } from "./state.js";
+import { daemonPaths, daemonStatus } from "./daemon.js";
+import { telegramApiBaseInfo } from "./telegram.js";
 import type { DoctorCheck, DoctorReport } from "../types.js";
 
 function isNotFound(err: unknown): boolean {
@@ -9,6 +11,18 @@ function isNotFound(err: unknown): boolean {
 }
 
 async function privateFileCheck(name: string, path: string): Promise<DoctorCheck> {
+  try {
+    const info = await stat(path);
+    const mode = info.mode & 0o777;
+    const ok = (mode & 0o077) === 0;
+    return { name, ok, detail: `${path} mode=${mode.toString(8)}` };
+  } catch (err) {
+    if (isNotFound(err)) return { name, ok: true, detail: `not created yet: ${path}` };
+    return { name, ok: false, detail: `${path}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+async function privateDirCheck(name: string, path: string): Promise<DoctorCheck> {
   try {
     const info = await stat(path);
     const mode = info.mode & 0o777;
@@ -30,10 +44,34 @@ async function commandExists(command: string): Promise<boolean> {
 
 export async function doctor(configPath = defaultConfigPath(), statePath = defaultStatePath()): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
-  let config = await loadConfig(configPath);
+  const config = await loadConfig(configPath);
+  const daemon = await daemonStatus();
+  const paths = daemonPaths();
 
   checks.push(await privateFileCheck("config", configPath));
   checks.push(await privateFileCheck("state", statePath));
+  checks.push(await privateDirCheck("daemon-dir", paths.dir));
+  checks.push(await privateFileCheck("daemon-metadata", paths.metadataFile));
+  checks.push({
+    name: "daemon-status",
+    ok: !daemon.stale,
+    detail: daemon.running ? `running pid=${daemon.pid}` : daemon.stale ? `stale pid=${daemon.pid}` : "not running",
+  });
+
+  try {
+    const apiBase = telegramApiBaseInfo();
+    checks.push({
+      name: "telegram-api-base",
+      ok: true,
+      detail: apiBase.overridden ? `overridden: ${apiBase.origin}${apiBase.pathname}` : apiBase.origin,
+    });
+  } catch (err) {
+    checks.push({
+      name: "telegram-api-base",
+      ok: false,
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
 
   for (const command of ["bridge", "codewith", "claude", "aicopilot"]) {
     checks.push({

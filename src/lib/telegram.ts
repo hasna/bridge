@@ -11,6 +11,46 @@ export interface TelegramUpdate {
   };
 }
 
+const DEFAULT_TELEGRAM_API_BASE = "https://api.telegram.org";
+
+export interface TelegramApiBaseInfo {
+  overridden: boolean;
+  origin: string;
+  pathname: string;
+}
+
+function telegramApiBase(): URL {
+  const raw = process.env["BRIDGE_TELEGRAM_API_BASE"] || DEFAULT_TELEGRAM_API_BASE;
+  const parsed = new URL(raw);
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("BRIDGE_TELEGRAM_API_BASE must use http or https");
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error("BRIDGE_TELEGRAM_API_BASE must not contain credentials");
+  }
+  if (parsed.search || parsed.hash) {
+    throw new Error("BRIDGE_TELEGRAM_API_BASE must not contain query strings or fragments");
+  }
+  return parsed;
+}
+
+export function telegramApiBaseInfo(): TelegramApiBaseInfo {
+  const parsed = telegramApiBase();
+  return {
+    overridden: parsed.href.replace(/\/$/, "") !== DEFAULT_TELEGRAM_API_BASE,
+    origin: parsed.origin,
+    pathname: parsed.pathname,
+  };
+}
+
+function telegramMethodUrl(token: string, method: string): string {
+  const base = telegramApiBase();
+  const prefix = base.pathname.replace(/\/$/, "");
+  base.pathname = `${prefix}/bot${token}/${method}`;
+  base.search = "";
+  return base.toString();
+}
+
 export function telegramToken(channel: TelegramChannelConfig): string {
   const envName = channel.botTokenEnv || "TELEGRAM_BOT_TOKEN";
   const token = process.env[envName];
@@ -25,7 +65,7 @@ export function telegramChatAllowed(channel: TelegramChannelConfig, chatId: stri
 }
 
 export async function sendTelegramMessage(token: string, chatId: string, text: string): Promise<unknown> {
-  const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+  const response = await fetch(telegramMethodUrl(token, "sendMessage"), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text }),
@@ -42,7 +82,7 @@ export async function getTelegramUpdates(
   const params = new URLSearchParams();
   if (options.offset !== undefined) params.set("offset", String(options.offset));
   params.set("timeout", String(options.timeoutSeconds ?? 20));
-  const response = await fetch(`https://api.telegram.org/bot${token}/getUpdates?${params.toString()}`);
+  const response = await fetch(`${telegramMethodUrl(token, "getUpdates")}?${params.toString()}`);
   const body = await response.json().catch(() => undefined) as { ok?: boolean; result?: TelegramUpdate[] };
   if (!response.ok || !body?.ok) {
     throw new Error(`Telegram getUpdates failed (${response.status}): ${JSON.stringify(body)}`);

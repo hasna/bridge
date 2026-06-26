@@ -49,3 +49,34 @@ secrets are not exposed through `bridge_config`.
 
 Long-poll offsets are persisted in a private state file so process restarts do
 not replay already-seen updates and re-run agents.
+
+`BRIDGE_TELEGRAM_API_BASE` can override the Telegram API origin for local tests.
+The override accepts only `http` or `https` URLs without credentials. It is not
+intended for normal production use because bot tokens are part of Telegram API
+request paths.
+
+## Daemon Model
+
+The foreground runtime remains `bridge serve`. Daemon commands are lifecycle
+wrappers around that same runtime:
+
+- `bridge daemon start` uses a local process supervisor by default.
+- `bridge daemon status` reads private metadata and verifies the recorded
+  process still looks like `bridge serve`.
+- `bridge daemon stop` terminates the process group and removes stale metadata.
+- `bridge daemon logs` reads private stdout/stderr logs.
+- `bridge daemon install` writes user `launchd` or user `systemd` files.
+
+The process supervisor is the quickest local testing path because it inherits
+the shell environment, including Telegram token env vars. Installed launchd and
+systemd services do not store token values by default; operators must make token
+env vars available through their service manager.
+
+Daemon files live under `~/.hasna/bridge/daemon` by default. The directory is
+`0700`; metadata and log files are `0600`. Logs are considered sensitive because
+they can contain prompts, Telegram text, agent stdout/stderr, and routing
+errors.
+
+`bridge serve` handles per-channel poll errors without exiting in long-running
+mode. `serve --once` still fails fast so health checks and tests can catch
+misconfiguration.

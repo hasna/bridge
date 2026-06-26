@@ -22,7 +22,7 @@ function text(value: unknown) {
 }
 
 export function buildServer(): McpServer {
-  const server = new McpServer({ name: "bridge", version: "0.2.0" });
+  const server = new McpServer({ name: "bridge", version: "0.2.1" });
 
   server.tool("bridge_status", {}, async () => text(await doctor()));
 

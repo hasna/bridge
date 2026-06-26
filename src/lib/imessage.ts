@@ -15,6 +15,9 @@ export interface IMessageRow {
   handle: string;
   chatGuid?: string;
   displayName?: string;
+  account?: string;
+  accountGuid?: string;
+  service?: string;
   text: string;
   date?: number;
 }
@@ -99,6 +102,56 @@ export function getIMessageDbPath(channel: IMessageChannelConfig): string {
   return channel.chatDbPath || defaultMessagesDbPath();
 }
 
+function tableColumns(db: Database, table: "message" | "handle" | "chat"): Set<string> {
+  const rows = db.query(`pragma table_info(${table})`).all() as Array<{ name?: string }>;
+  return new Set(rows.map((row) => row.name).filter((name): name is string => Boolean(name)));
+}
+
+function selectColumn(columns: Set<string>, table: string, column: string, alias: string): string {
+  return columns.has(column) ? `${table}.${column} as ${alias}` : `null as ${alias}`;
+}
+
+function normalizeIdentifier(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function valueMatchesConfigured(value: string | undefined, expected: string | undefined): boolean {
+  if (!value || !expected) return false;
+  const normalizedValue = normalizeIdentifier(value);
+  const normalizedExpected = normalizeIdentifier(expected);
+  return normalizedValue === normalizedExpected
+    || normalizedValue.endsWith(`:${normalizedExpected}`)
+    || normalizedValue.endsWith(`;${normalizedExpected}`);
+}
+
+function rowMatchesAccount(channel: IMessageChannelConfig, row: {
+  account?: string;
+  accountGuid?: string;
+  chatAccount?: string;
+}): boolean {
+  if (!channel.account) return true;
+  const rowCandidates = [row.account, row.accountGuid].filter(Boolean);
+  const candidates = rowCandidates.length ? rowCandidates : [row.chatAccount].filter(Boolean);
+  return candidates.some((value) => valueMatchesConfigured(value, channel.account));
+}
+
+function rowMatchesService(channel: IMessageChannelConfig, row: {
+  service?: string;
+  handleService?: string;
+  chatService?: string;
+}): boolean {
+  const expected = channel.serviceName || "iMessage";
+  const candidates = row.service
+    ? [row.service]
+    : row.handleService
+      ? [row.handleService]
+      : row.chatService
+        ? [row.chatService]
+        : [];
+  if (!candidates.length) return true;
+  return candidates.some((value) => valueMatchesConfigured(value, expected));
+}
+
 export function getIMessageMessages(
   channel: IMessageChannelConfig,
   options: { afterRowId?: number; limit?: number } = {},
@@ -106,12 +159,21 @@ export function getIMessageMessages(
   if ((channel.receiveMode || "disabled") !== "chat-db") return [];
   const db = new Database(getIMessageDbPath(channel), { readonly: true });
   try {
+    const messageColumns = tableColumns(db, "message");
+    const handleColumns = tableColumns(db, "handle");
+    const chatColumns = tableColumns(db, "chat");
     const limit = options.limit || channel.pollLimit || 50;
     const scanLimit = Math.max(limit * 10, limit);
     const rows = db.query(`
       select
         message.ROWID as rowId,
         handle.id as handle,
+        ${selectColumn(messageColumns, "message", "account", "account")},
+        ${selectColumn(messageColumns, "message", "account_guid", "accountGuid")},
+        ${selectColumn(messageColumns, "message", "service", "service")},
+        ${selectColumn(handleColumns, "handle", "service", "handleService")},
+        ${selectColumn(chatColumns, "chat", "account_login", "chatAccount")},
+        ${selectColumn(chatColumns, "chat", "service_name", "chatService")},
         chat.guid as chatGuid,
         chat.display_name as displayName,
         message.text as text,
@@ -128,16 +190,31 @@ export function getIMessageMessages(
     `).all(options.afterRowId || 0, scanLimit) as Array<{
       rowId: number;
       handle?: string;
+      account?: string;
+      accountGuid?: string;
+      service?: string;
+      handleService?: string;
+      chatAccount?: string;
+      chatService?: string;
       chatGuid?: string;
       displayName?: string;
       text?: string;
       date?: number;
     }>;
     return rows
-      .filter((row) => row.handle && row.text && imessageHandleAllowed(channel, row.handle))
+      .filter((row) =>
+        row.handle
+        && row.text
+        && imessageHandleAllowed(channel, row.handle)
+        && rowMatchesAccount(channel, row)
+        && rowMatchesService(channel, row)
+      )
       .slice(0, limit)
       .map((row) => {
         const item: IMessageRow = { rowId: row.rowId, handle: row.handle!, text: row.text!, date: row.date };
+        if (row.account) item.account = row.account;
+        if (row.accountGuid) item.accountGuid = row.accountGuid;
+        if (row.service || row.handleService || row.chatService) item.service = row.service || row.handleService || row.chatService;
         if (row.chatGuid) item.chatGuid = row.chatGuid;
         if (row.displayName) item.displayName = row.displayName;
         return item;

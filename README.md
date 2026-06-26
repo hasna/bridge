@@ -143,7 +143,17 @@ bridge agents add aicopilot-main --kind aicopilot --profile aicopilot-main
 
 - `bridge_status`
 - `bridge_config`
+- `bridge_session_list`
+- `bridge_session_status`
+- `bridge_session_create`
+- `bridge_session_attach`
+- `bridge_session_send`
+- `bridge_session_route_message`
 - `bridge_route_message`
+
+Use `bridge_session_route_message` for normal inbound channel behavior through
+session bindings. `bridge_route_message` remains for compatibility with explicit
+stateless routes.
 
 ## State
 
@@ -233,6 +243,10 @@ If your Mac has more than one Messages account, add the account selector:
 ```sh
 bridge channels add-imessage imessage-main --allowed-handles +15555550100 --account you@example.com
 ```
+
+For receive mode, configured accounts are also used as a filter when Messages
+stores account metadata in `chat.db`. If an account is configured but an inbound
+row has no matching account metadata, the row is skipped rather than routed.
 
 Enable local receive polling only when you are comfortable granting the daemon
 host access to Messages data:

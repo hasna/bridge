@@ -129,6 +129,70 @@ test("iMessage polling scans past disallowed rows and preserves group chat ident
   expect(imessageRowToMessage("im", rows[0]!).chatId).toBe("chat:iMessage;-;group-guid");
 });
 
+test("iMessage receive filters by configured account and tags row account metadata", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-imessage-account-"));
+  const path = join(dir, "chat.db");
+  const db = new Database(path);
+  db.run("create table handle (ROWID integer primary key, id text, service text)");
+  db.run("create table message (ROWID integer primary key, handle_id integer, account text, account_guid text, service text, text text, date integer, is_from_me integer)");
+  db.run("create table chat (ROWID integer primary key, guid text, display_name text, account_login text, service_name text)");
+  db.run("create table chat_message_join (chat_id integer, message_id integer)");
+  db.run("insert into handle (ROWID, id, service) values (1, '+15555550100', 'iMessage')");
+  db.run("insert into chat (ROWID, guid, display_name, account_login, service_name) values (1, 'iMessage;-;group-guid', 'Group', 'andrei@example.com', 'iMessage')");
+  db.run("insert into message (ROWID, handle_id, account, account_guid, service, text, date, is_from_me) values (20, 1, 'other@example.com', 'iMessage;+;other@example.com', 'iMessage', 'wrong account', 0, 0)");
+  db.run("insert into message (ROWID, handle_id, account, account_guid, service, text, date, is_from_me) values (21, 1, 'andrei@example.com', 'iMessage;+;andrei@example.com', 'iMessage', 'right account', 0, 0)");
+  db.run("insert into message (ROWID, handle_id, account, account_guid, service, text, date, is_from_me) values (22, 1, 'andrei@example.com', 'iMessage;+;andrei@example.com', 'SMS', 'wrong service', 0, 0)");
+  db.run("insert into chat_message_join (chat_id, message_id) values (1, 20), (1, 21), (1, 22)");
+  db.close();
+
+  const rows = getIMessageMessages({
+    ...channel,
+    account: "andrei@example.com",
+    serviceName: "iMessage",
+    receiveMode: "chat-db",
+    chatDbPath: path,
+  });
+
+  expect(rows).toEqual([{
+    rowId: 21,
+    handle: "+15555550100",
+    chatGuid: "iMessage;-;group-guid",
+    displayName: "Group",
+    account: "andrei@example.com",
+    accountGuid: "iMessage;+;andrei@example.com",
+    service: "iMessage",
+    text: "right account",
+    date: 0,
+  }]);
+  const message = imessageRowToMessage("im", rows[0]!);
+  expect(message.chatId).toBe("chat:iMessage;-;group-guid");
+  expect(message.responseTargetId).toBe("chat:iMessage;-;group-guid");
+});
+
+test("iMessage receive with a configured account fails closed without account metadata", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-imessage-account-"));
+  const path = join(dir, "chat.db");
+  const db = new Database(path);
+  db.run("create table handle (ROWID integer primary key, id text)");
+  db.run("create table message (ROWID integer primary key, handle_id integer, text text, date integer, is_from_me integer)");
+  db.run("create table chat (ROWID integer primary key, guid text, display_name text)");
+  db.run("create table chat_message_join (chat_id integer, message_id integer)");
+  db.run("insert into handle (ROWID, id) values (1, '+15555550100')");
+  db.run("insert into chat (ROWID, guid, display_name) values (1, 'iMessage;-;+15555550100', 'One')");
+  db.run("insert into message (ROWID, handle_id, text, date, is_from_me) values (30, 1, 'no account metadata', 0, 0)");
+  db.run("insert into chat_message_join (chat_id, message_id) values (1, 30)");
+  db.close();
+
+  const rows = getIMessageMessages({
+    ...channel,
+    account: "andrei@example.com",
+    receiveMode: "chat-db",
+    chatDbPath: path,
+  });
+
+  expect(rows).toEqual([]);
+});
+
 test("CLI adds iMessage channel config", async () => {
   const dir = await mkdtemp(join(tmpdir(), "bridge-imessage-cli-"));
   const configPath = join(dir, "config.json");

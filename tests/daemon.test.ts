@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { Database } from "bun:sqlite";
 import {
   daemonLogs,
   daemonPaths,
@@ -200,6 +201,162 @@ test("process daemon starts, polls fake Telegram, reports status, logs, and stop
   } finally {
     server.stop(true);
   }
+});
+
+test("running daemon reloads state before routing Telegram updates", async () => {
+  let allowUpdate = false;
+  let sentText = "";
+  const update = {
+    update_id: 200,
+    message: {
+      message_id: 1,
+      text: "live",
+      chat: { id: 1, type: "private" },
+      date: 0,
+    },
+  };
+  const server = Bun.serve({
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/getUpdates")) {
+        const offset = Number(url.searchParams.get("offset") || "0");
+        return Response.json({ ok: true, result: allowUpdate && offset <= 200 ? [update] : [] });
+      }
+      if (url.pathname.endsWith("/sendMessage")) {
+        const body = await request.json() as { text?: string };
+        sentText = body.text || "";
+        return Response.json({ ok: true, result: {} });
+      }
+      return Response.json({ ok: false }, { status: 404 });
+    },
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), "bridge-daemon-"));
+  const daemonDir = join(dir, "daemon");
+  daemonDirs.push(daemonDir);
+  const configPath = join(dir, "config.json");
+  const statePath = join(dir, "state.json");
+  const config: BridgeConfig = {
+    ...testConfig(),
+    profiles: {},
+    agents: {
+      echo: { id: "echo", kind: "shell", command: "printf", args: ["bridge ok: {prompt}"] },
+    },
+    routes: [],
+  };
+  await saveConfig(config, configPath);
+  const env = {
+    TG_TEST_TOKEN: "test-token",
+    BRIDGE_TELEGRAM_API_BASE: `http://127.0.0.1:${server.port}`,
+  };
+
+  try {
+    const start = await runCli([
+      "daemon",
+      "start",
+      "--daemon-dir",
+      daemonDir,
+      "--config",
+      configPath,
+      "--state",
+      statePath,
+      "--interval",
+      "50",
+      "--json",
+    ], env);
+    expect(start.exitCode).toBe(0);
+
+    const create = await runCli([
+      "sessions",
+      "create",
+      "--id",
+      "ses_live",
+      "--agent",
+      "echo",
+      "--config",
+      configPath,
+      "--state",
+      statePath,
+      "--json",
+    ], env);
+    expect(create.exitCode).toBe(0);
+
+    const attach = await runCli([
+      "sessions",
+      "attach",
+      "ses_live",
+      "--channel",
+      "tg",
+      "--conversation",
+      "1",
+      "--config",
+      configPath,
+      "--state",
+      statePath,
+      "--json",
+    ], env);
+    expect(attach.exitCode).toBe(0);
+
+    allowUpdate = true;
+    for (let i = 0; i < 40 && !sentText; i++) await Bun.sleep(100);
+    expect(sentText).toBe("bridge ok: live");
+  } finally {
+    server.stop(true);
+  }
+});
+
+test("process daemon starts with an iMessage-only receive config", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-daemon-"));
+  const daemonDir = join(dir, "daemon");
+  daemonDirs.push(daemonDir);
+  const configPath = join(dir, "config.json");
+  const statePath = join(dir, "state.json");
+  const chatDbPath = join(dir, "chat.db");
+  const db = new Database(chatDbPath);
+  db.run("create table handle (ROWID integer primary key, id text)");
+  db.run("create table message (ROWID integer primary key, handle_id integer, text text, date integer, is_from_me integer)");
+  db.run("create table chat (ROWID integer primary key, guid text, display_name text)");
+  db.run("create table chat_message_join (chat_id integer, message_id integer)");
+  db.close();
+
+  const config: BridgeConfig = {
+    version: 1,
+    channels: {
+      im: {
+        id: "im",
+        kind: "imessage",
+        enabled: true,
+        allowAllHandles: true,
+        receiveMode: "chat-db",
+        chatDbPath,
+      },
+    },
+    profiles: {},
+    agents: {},
+    routes: [],
+  };
+  await saveConfig(config, configPath);
+
+  const start = await runCli([
+    "daemon",
+    "start",
+    "--daemon-dir",
+    daemonDir,
+    "--config",
+    configPath,
+    "--state",
+    statePath,
+    "--interval",
+    "50",
+    "--json",
+  ]);
+  expect(start.exitCode).toBe(0);
+  const started = JSON.parse(start.stdout);
+  expect(started.running).toBe(true);
+
+  const stop = await runCli(["daemon", "stop", "--daemon-dir", daemonDir, "--json"]);
+  expect(stop.exitCode).toBe(0);
 });
 
 test("daemon CLI rejects partial numeric values", async () => {

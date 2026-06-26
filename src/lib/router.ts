@@ -1,5 +1,6 @@
 import type { BridgeConfig, BridgeMessage, ChannelConfig, RoutedMessageResult, RouteConfig } from "../types.js";
 import { runAgent } from "./agents.js";
+import { imessageHandleAllowed, sendIMessage } from "./imessage.js";
 import { sendTelegramMessage, telegramChatAllowed, telegramToken } from "./telegram.js";
 
 export interface RouteMessageOptions {
@@ -12,6 +13,9 @@ export function matchingRoutes(config: BridgeConfig, message: BridgeMessage): Ro
   const channel = config.channels[message.channelId];
   if (!channel || channel.enabled === false) return [];
   if (channel?.kind === "telegram" && !telegramChatAllowed(channel, message.chatId)) {
+    return [];
+  }
+  if (channel?.kind === "imessage" && !imessageHandleAllowed(channel, message.from || (message.chatId?.startsWith("chat:") ? undefined : message.chatId))) {
     return [];
   }
 
@@ -58,6 +62,13 @@ export async function routeMessage(
     } else if (responseText && channel?.kind === "console") {
       if (options.writeConsole !== false) (options.writeConsole || console.log)(responseText);
       deliveredResponse = true;
+    } else if (responseText && channel?.kind === "imessage") {
+      const handle = message.responseTargetId || message.chatId || message.from;
+      const allowedIdentity = message.from || (handle?.startsWith("chat:") ? undefined : handle);
+      if (handle && imessageHandleAllowed(channel, allowedIdentity)) {
+        await sendIMessage(channel, handle, responseText, { allowChatTarget: handle.startsWith("chat:") });
+        deliveredResponse = true;
+      }
     }
 
     results.push({ route, agent, deliveredResponse });

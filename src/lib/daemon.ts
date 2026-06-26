@@ -6,7 +6,7 @@ import { loadConfig } from "./config.js";
 import { bridgeHome, defaultConfigPath } from "./paths.js";
 import { defaultStatePath } from "./state.js";
 import { telegramApiBaseInfo } from "./telegram.js";
-import type { BridgeConfig, TelegramChannelConfig } from "../types.js";
+import type { BridgeConfig, IMessageChannelConfig, TelegramChannelConfig } from "../types.js";
 
 export type DaemonSupervisor = "process" | "launchd" | "systemd";
 export type DaemonSupervisorOption = DaemonSupervisor | "auto";
@@ -282,14 +282,20 @@ function telegramChannels(config: BridgeConfig): TelegramChannelConfig[] {
   );
 }
 
+function imessagePollChannels(config: BridgeConfig): IMessageChannelConfig[] {
+  return Object.values(config.channels).filter(
+    (channel): channel is IMessageChannelConfig => channel.kind === "imessage" && channel.enabled !== false && channel.receiveMode === "chat-db",
+  );
+}
+
 export function requiredTelegramEnvVars(config: BridgeConfig): string[] {
   return [...new Set(telegramChannels(config).map((channel) => channel.botTokenEnv || "TELEGRAM_BOT_TOKEN"))];
 }
 
 async function validateStartConfig(configPath: string): Promise<void> {
   const config = await loadConfig(configPath);
-  const channels = telegramChannels(config);
-  if (!channels.length) throw new Error("No enabled Telegram channels configured; add one before starting the daemon");
+  const channels = [...telegramChannels(config), ...imessagePollChannels(config)];
+  if (!channels.length) throw new Error("No enabled pollable channels configured; add Telegram or iMessage receive before starting the daemon");
   for (const envName of requiredTelegramEnvVars(config)) {
     if (!process.env[envName]) throw new Error(`Missing Telegram bot token env var for daemon start: ${envName}`);
   }

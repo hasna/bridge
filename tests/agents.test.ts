@@ -1,5 +1,16 @@
 import { expect, test } from "bun:test";
-import { buildAgentCommand, resolveAgent, type BridgeConfig } from "../src/index.js";
+import {
+  buildAgentCommand,
+  cancelAgentSession,
+  closeAgentSession,
+  createAgentSessionRef,
+  resumeAgentSessionRef,
+  resolveAgent,
+  sendAgentSessionMessage,
+  type AgentRunResult,
+  type BridgeConfig,
+  type BridgeSession,
+} from "../src/index.js";
 
 const baseConfig: BridgeConfig = {
   version: 1,
@@ -60,4 +71,68 @@ test("rejects profile kind mismatches", () => {
     },
   };
   expect(() => resolveAgent(config, "bad")).toThrow("not codewith");
+});
+
+test("creates explicit compatibility agent session refs", () => {
+  const ref = createAgentSessionRef(baseConfig, "codewith");
+  expect(ref.kind).toBe("codewith");
+  expect(ref.mode).toBe("compatibility");
+  expect(ref.detail).toContain("compatibility mode");
+});
+
+test("sends session messages through the injectable runner", async () => {
+  const session: BridgeSession = {
+    id: "ses_test",
+    agentId: "codewith",
+    profileId: "cw-main",
+    cwd: "/repo",
+    status: "active",
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString(),
+    agentSession: createAgentSessionRef(baseConfig, "codewith"),
+  };
+  const result = await sendAgentSessionMessage(baseConfig, session, input.message, {
+    run: async (_config, agentId, runInput): Promise<AgentRunResult> => ({
+      agentId,
+      command: ["fake"],
+      cwd: runInput.session?.cwd,
+      exitCode: 0,
+      stdout: `ok:${runInput.route.id}:${runInput.message.text}`,
+      stderr: "",
+      timedOut: false,
+    }),
+  });
+
+  expect(result.stdout).toBe("ok:session:ses_test:hello");
+  expect(result.cwd).toBe("/repo");
+});
+
+test("session cwd overrides agent and profile cwd", () => {
+  const session: BridgeSession = {
+    id: "ses_cwd",
+    agentId: "codewith",
+    profileId: "cw-main",
+    cwd: "/session-repo",
+    status: "active",
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString(),
+  };
+  const result = buildAgentCommand(baseConfig, "codewith", { ...input, session });
+  expect(result.cwd).toBe("/session-repo");
+  expect(result.command).toEqual(["codewith", "--auth-profile", "account001", "--cd", "/session-repo", "exec", "hello"]);
+});
+
+test("reports compatibility resume cancel and close limitations", () => {
+  const session: BridgeSession = {
+    id: "ses_test",
+    agentId: "codewith",
+    status: "active",
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString(),
+    agentSession: createAgentSessionRef(baseConfig, "codewith"),
+  };
+
+  expect(resumeAgentSessionRef(session).supported).toBe(false);
+  expect(cancelAgentSession(session).supported).toBe(false);
+  expect(closeAgentSession(session).supported).toBe(false);
 });

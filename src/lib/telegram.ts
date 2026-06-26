@@ -5,6 +5,7 @@ export interface TelegramUpdate {
   message?: {
     message_id: number;
     text?: string;
+    message_thread_id?: number;
     chat: { id: number | string; type?: string; username?: string };
     from?: { id: number | string; username?: string; first_name?: string };
     date?: number;
@@ -99,6 +100,7 @@ export function telegramUpdateToMessage(channelId: string, update: TelegramUpdat
     channelId,
     text,
     chatId: String(chatId),
+    threadId: update.message?.message_thread_id !== undefined ? String(update.message.message_thread_id) : undefined,
     from: update.message?.from?.username || (update.message?.from?.id !== undefined ? String(update.message.from.id) : undefined),
     receivedAt: update.message?.date ? new Date(update.message.date * 1000).toISOString() : new Date().toISOString(),
     raw: update,

@@ -1,9 +1,19 @@
-import type { AgentConfig, AgentRunInput, AgentRunResult, BridgeConfig, ProfileConfig } from "../types.js";
+import type { AgentConfig, AgentRunInput, AgentRunResult, AgentSessionRef, BridgeConfig, BridgeMessage, BridgeSession, ProfileConfig } from "../types.js";
 
 export interface BuiltAgentCommand {
   command: string[];
   cwd?: string;
   env?: Record<string, string>;
+}
+
+export interface AgentSessionOperationResult {
+  supported: boolean;
+  detail: string;
+  ref?: AgentSessionRef;
+}
+
+export interface AgentSessionSendOptions {
+  run?: typeof runAgent;
 }
 
 function renderCustomArgs(args: string[] | undefined, prompt: string): string[] {
@@ -23,6 +33,11 @@ function mergeEnv(profile?: ProfileConfig, agent?: AgentConfig): Record<string, 
   return Object.keys(env).length ? env : undefined;
 }
 
+function compatibilityDetail(kind: string): string {
+  if (kind === "shell") return "shell command session; local bridge state is durable";
+  return "compatibility mode: this adapter invokes the current CLI one message at a time until a stable create/send/resume API is wired";
+}
+
 export function resolveAgent(config: BridgeConfig, agentId: string): { agent: AgentConfig; profile?: ProfileConfig } {
   const agent = config.agents[agentId];
   if (!agent) throw new Error(`Agent not found: ${agentId}`);
@@ -40,7 +55,7 @@ export function buildAgentCommand(config: BridgeConfig, agentId: string, input: 
   const kind = agent.kind;
   const command = agent.command || profile?.command;
   const args = agent.args || profile?.args;
-  const cwd = agent.cwd || profile?.cwd;
+  const cwd = input.session?.cwd || agent.cwd || profile?.cwd;
   const env = mergeEnv(profile, agent);
 
   if (command) {
@@ -64,6 +79,60 @@ export function buildAgentCommand(config: BridgeConfig, agentId: string, input: 
   }
 
   return { command: ["sh", "-lc", prompt], cwd, env };
+}
+
+export function createAgentSessionRef(config: BridgeConfig, agentId: string): AgentSessionRef {
+  const { agent } = resolveAgent(config, agentId);
+  const timestamp = new Date().toISOString();
+  return {
+    kind: agent.kind,
+    mode: "compatibility",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    detail: compatibilityDetail(agent.kind),
+  };
+}
+
+export function resumeAgentSessionRef(session: BridgeSession): AgentSessionOperationResult {
+  return {
+    supported: session.agentSession?.mode === "durable",
+    ref: session.agentSession,
+    detail: session.agentSession?.mode === "durable"
+      ? "durable agent session ref is available"
+      : "compatibility sessions do not expose agent-side resume; bridge binding state is still durable",
+  };
+}
+
+export function cancelAgentSession(session: BridgeSession): AgentSessionOperationResult {
+  return {
+    supported: false,
+    ref: session.agentSession,
+    detail: `cancel is not implemented for ${session.agentSession?.kind || "unknown"} ${session.agentSession?.mode || "compatibility"} sessions`,
+  };
+}
+
+export function closeAgentSession(session: BridgeSession): AgentSessionOperationResult {
+  return {
+    supported: session.agentSession?.mode === "durable",
+    ref: session.agentSession,
+    detail: session.agentSession?.mode === "durable"
+      ? "durable close is adapter-owned"
+      : "compatibility close only updates bridge session state",
+  };
+}
+
+export async function sendAgentSessionMessage(
+  config: BridgeConfig,
+  session: BridgeSession,
+  message: BridgeMessage,
+  options: AgentSessionSendOptions = {},
+): Promise<AgentRunResult> {
+  const run = options.run || runAgent;
+  return run(config, session.agentId, {
+    message,
+    route: { id: `session:${session.id}`, fromChannel: message.channelId, toAgent: session.agentId },
+    session,
+  });
 }
 
 export async function runAgent(config: BridgeConfig, agentId: string, input: AgentRunInput): Promise<AgentRunResult> {

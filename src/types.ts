@@ -34,6 +34,13 @@ export interface WebhookChannelConfig extends BaseChannelConfig {
 export interface IMessageChannelConfig extends BaseChannelConfig {
   kind: "imessage";
   account?: string;
+  serviceName?: string;
+  defaultHandle?: string;
+  allowedHandles?: string[];
+  allowAllHandles?: boolean;
+  receiveMode?: "disabled" | "chat-db";
+  chatDbPath?: string;
+  pollLimit?: number;
 }
 
 export type ChannelConfig =
@@ -93,14 +100,76 @@ export interface BridgeMessage {
   channelId: string;
   text: string;
   chatId?: string;
+  threadId?: string;
+  responseTargetId?: string;
   from?: string;
   receivedAt: string;
   raw?: unknown;
 }
 
+export type BridgeSessionStatus = "active" | "paused" | "closed";
+export type AgentSessionMode = "durable" | "compatibility";
+
+export interface AgentSessionRef {
+  kind: AgentKind;
+  mode: AgentSessionMode;
+  refId?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  detail?: string;
+}
+
+export interface BridgeSession {
+  id: string;
+  agentId: string;
+  profileId?: string;
+  cwd?: string;
+  title?: string;
+  status: BridgeSessionStatus;
+  createdAt: string;
+  updatedAt: string;
+  lastMessageAt?: string;
+  agentSession?: AgentSessionRef;
+}
+
+export interface BridgeBinding {
+  id: string;
+  channelId: string;
+  conversationId: string;
+  activeSessionId: string;
+  defaultSessionId?: string;
+  createdAt: string;
+  updatedAt: string;
+  authorization?: {
+    chatId?: string;
+    from?: string;
+  };
+}
+
+export type LedgerStatus = "processing" | "agent_completed" | "delivered" | "skipped" | "unauthorized" | "failed";
+
+export interface MessageLedgerEntry {
+  id: string;
+  channelId: string;
+  messageId: string;
+  conversationId?: string;
+  sessionId?: string;
+  status: LedgerStatus;
+  attempts: number;
+  firstSeenAt: string;
+  updatedAt: string;
+  terminalAt?: string;
+  error?: string;
+  responseText?: string;
+  deliveredResponse?: boolean;
+  agentExitCode?: number | null;
+  agentTimedOut?: boolean;
+}
+
 export interface AgentRunInput {
   message: BridgeMessage;
   route: RouteConfig;
+  session?: BridgeSession;
 }
 
 export interface AgentRunResult {
@@ -117,6 +186,17 @@ export interface RoutedMessageResult {
   route: RouteConfig;
   agent: AgentRunResult;
   deliveredResponse?: boolean;
+}
+
+export interface SessionMessageResult {
+  kind: "session";
+  session?: BridgeSession;
+  binding?: BridgeBinding;
+  conversationId?: string;
+  agent?: AgentRunResult;
+  deliveredResponse?: boolean;
+  status: "delivered" | "no_session" | "paused" | "closed" | "unauthorized" | "no_output" | "failed";
+  message?: string;
 }
 
 export interface DoctorCheck {

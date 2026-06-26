@@ -3,6 +3,7 @@ import { defaultConfigPath } from "./paths.js";
 import { loadConfig } from "./config.js";
 import { defaultStatePath } from "./state.js";
 import { daemonPaths, daemonStatus } from "./daemon.js";
+import { diagnoseIMessage } from "./imessage.js";
 import { telegramApiBaseInfo } from "./telegram.js";
 import type { DoctorCheck, DoctorReport } from "../types.js";
 
@@ -102,6 +103,11 @@ export async function doctor(configPath = defaultConfigPath(), statePath = defau
       ok: Boolean(config.channels[route.fromChannel] && config.agents[route.toAgent]),
       detail: `${route.fromChannel} -> ${route.toAgent}`,
     });
+  }
+
+  const imessageChannels = Object.values(config.channels).filter((channel) => channel.kind === "imessage");
+  for (const channel of imessageChannels) {
+    checks.push(...await diagnoseIMessage(channel));
   }
 
   return { ok: checks.every((check) => check.ok), configPath, checks };

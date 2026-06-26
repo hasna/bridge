@@ -27,14 +27,27 @@ import {
   stopProcessDaemon,
   uninstallDaemon,
   getTelegramUpdates,
+  getIMessageMessages,
+  imessageHandleAllowed,
+  imessageRowToMessage,
+  sendIMessage,
   telegramToken,
   telegramUpdateToMessage,
   defaultConfigPath,
   defaultStatePath,
   loadState,
   saveState,
+  attachBridgeSession,
+  createBridgeSession,
+  detachBridgeBinding,
+  dispatchMessageWithSessions,
+  getBridgeSession,
+  listBridgeSessions,
+  sendBridgeSessionMessage,
+  updateBridgeSessionStatus,
   type AgentKind,
   type BridgeMessage,
+  type IMessageChannelConfig,
   type TelegramChannelConfig,
 } from "../index.js";
 
@@ -86,11 +99,13 @@ async function runServe(options: { once?: boolean; interval?: string; json?: boo
   const telegramChannels = Object.values(config.channels).filter(
     (channel): channel is TelegramChannelConfig => channel.kind === "telegram" && channel.enabled !== false,
   );
+  const imessageChannels = Object.values(config.channels).filter(
+    (channel): channel is IMessageChannelConfig => channel.kind === "imessage" && channel.enabled !== false && channel.receiveMode === "chat-db",
+  );
   const intervalMs = parseNonNegativeInt(options.interval || "1000", "--interval");
-  if (!telegramChannels.length) throw new Error("No enabled Telegram channels configured");
+  if (!telegramChannels.length && !imessageChannels.length) throw new Error("No enabled pollable channels configured");
 
   const statePath = options.state || defaultStatePath();
-  const state = await loadState(statePath);
   const errorCounts = new Map<string, number>();
   let stopping = false;
   const stop = () => {
@@ -101,18 +116,76 @@ async function runServe(options: { once?: boolean; interval?: string; json?: boo
   while (!stopping) {
     for (const channel of telegramChannels) {
       try {
+        const pollState = await loadState(statePath);
         const updates = await getTelegramUpdates(telegramToken(channel), {
-          offset: state.telegramOffsets[channel.id],
+          offset: pollState.telegramOffsets[channel.id],
           timeoutSeconds: channel.pollTimeoutSeconds || 20,
         });
         errorCounts.delete(channel.id);
         for (const update of updates) {
-          state.telegramOffsets[channel.id] = update.update_id + 1;
-          await saveState(state, statePath);
+          const state = await loadState(statePath);
           const message = telegramUpdateToMessage(channel.id, update);
-          if (!message) continue;
-          const results = await routeMessage(config, message, { writeConsole: options.json ? false : undefined });
-          if (options.json) asJson({ message, results });
+          if (message) {
+            try {
+              const results = await dispatchMessageWithSessions(config, state, message, {
+                writeConsole: options.json ? false : undefined,
+                fallbackToRoutes: true,
+                persistState: async (nextState) => saveState(nextState, statePath),
+              });
+              if (results.ledger?.status === "failed" || results.ledger?.status === "processing" || results.ledger?.status === "agent_completed") {
+                await saveState(state, statePath);
+                throw new Error(results.ledger.error || `Message ${message.id} did not reach a terminal state`);
+              }
+              state.telegramOffsets[channel.id] = update.update_id + 1;
+              await saveState(state, statePath);
+              if (options.json) asJson(results);
+            } catch (err) {
+              await saveState(state, statePath);
+              throw err;
+            }
+          } else {
+            state.telegramOffsets[channel.id] = update.update_id + 1;
+            await saveState(state, statePath);
+          }
+        }
+      } catch (err) {
+        if (options.once) throw err;
+        const count = (errorCounts.get(channel.id) || 0) + 1;
+        errorCounts.set(channel.id, count);
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[bridge] ${channel.id} poll failed (${count}): ${message}`);
+        await Bun.sleep(Math.min(30_000, Math.max(1000, intervalMs * Math.min(count, 30))));
+      }
+    }
+    for (const channel of imessageChannels) {
+      try {
+        const pollState = await loadState(statePath);
+        const cursorKey = `imessage:${channel.id}`;
+        const rows = getIMessageMessages(channel, {
+          afterRowId: Number(pollState.cursors[cursorKey] || 0),
+          limit: channel.pollLimit || 50,
+        });
+        errorCounts.delete(channel.id);
+        for (const row of rows) {
+          const state = await loadState(statePath);
+          const message = imessageRowToMessage(channel.id, row);
+          try {
+            const results = await dispatchMessageWithSessions(config, state, message, {
+              writeConsole: options.json ? false : undefined,
+              fallbackToRoutes: true,
+              persistState: async (nextState) => saveState(nextState, statePath),
+            });
+            if (results.ledger?.status === "failed" || results.ledger?.status === "processing" || results.ledger?.status === "agent_completed") {
+              await saveState(state, statePath);
+              throw new Error(results.ledger.error || `Message ${message.id} did not reach a terminal state`);
+            }
+            state.cursors[cursorKey] = row.rowId;
+            await saveState(state, statePath);
+            if (options.json) asJson(results);
+          } catch (err) {
+            await saveState(state, statePath);
+            throw err;
+          }
         }
       } catch (err) {
         if (options.once) throw err;
@@ -213,6 +286,41 @@ channels
     const config = await upsertChannel({ id, kind: "console", enabled: true }, options.config);
     options.json ? asJson(config.channels[id]) : console.log(`Added console channel ${id}`);
   });
+channels
+  .command("add-imessage")
+  .argument("<id>")
+  .description("Add a local macOS iMessage channel")
+  .option("--default-handle <handle>", "default iMessage handle for bridge send")
+  .option("--allowed-handles <handles>", "comma-separated allowed handles")
+  .option("--allow-all-handles", "explicitly allow every local iMessage handle")
+  .option("--account <account>", "Messages account selector for multi-account Macs")
+  .option("--service-name <name>", "Messages service name", "iMessage")
+  .option("--receive", "enable local Messages chat.db polling")
+  .option("--chat-db-path <path>", "override Messages chat.db path")
+  .option("--poll-limit <n>", "maximum rows per poll")
+  .option("-c, --config <path>", "config path", defaultConfigPath())
+  .option("--json", "output JSON")
+  .action(async (id, options) => {
+    const allowedHandles = splitCsv(options.allowedHandles);
+    if (!allowedHandles?.length && !options.allowAllHandles) {
+      throw new Error("iMessage channels require --allowed-handles or explicit --allow-all-handles");
+    }
+    const pollLimit = options.pollLimit ? Number.parseInt(options.pollLimit, 10) : undefined;
+    const config = await upsertChannel({
+      id,
+      kind: "imessage",
+      enabled: true,
+      defaultHandle: options.defaultHandle,
+      allowedHandles,
+      allowAllHandles: Boolean(options.allowAllHandles),
+      account: options.account,
+      serviceName: options.serviceName,
+      receiveMode: options.receive ? "chat-db" : "disabled",
+      chatDbPath: options.chatDbPath,
+      pollLimit,
+    }, options.config);
+    options.json ? asJson(config.channels[id]) : console.log(`Added imessage channel ${id}`);
+  });
 
 const profiles = program.command("profiles").description("Manage reusable agent profiles");
 profiles.command("list").option("-c, --config <path>", "config path", defaultConfigPath()).option("--json", "output JSON").action(async (options) => {
@@ -307,6 +415,166 @@ routes
     options.json ? asJson(config.routes.find((route) => route.id === id)) : console.log(`Added route ${id}`);
   });
 
+const sessions = program.command("sessions").description("Manage durable bridge sessions and channel bindings");
+sessions
+  .command("list")
+  .description("List bridge sessions")
+  .option("--state <path>", "state path", defaultStatePath())
+  .option("--json", "output JSON")
+  .action(async (options) => {
+    const state = await loadState(options.state);
+    const items = listBridgeSessions(state);
+    options.json ? asJson(items) : printList(items);
+  });
+sessions
+  .command("show")
+  .argument("<id>")
+  .description("Show one bridge session")
+  .option("--state <path>", "state path", defaultStatePath())
+  .option("--json", "output JSON")
+  .action(async (id, options) => {
+    const state = await loadState(options.state);
+    const session = getBridgeSession(state, id);
+    options.json ? asJson(session) : console.log(JSON.stringify(session, null, 2));
+  });
+sessions
+  .command("create")
+  .description("Create a bridge-owned session for an agent")
+  .requiredOption("--agent <id>", "agent id")
+  .option("--id <id>", "explicit session id")
+  .option("--title <text>", "session title")
+  .option("--cwd <path>", "session working directory override")
+  .option("-c, --config <path>", "config path", defaultConfigPath())
+  .option("--state <path>", "state path", defaultStatePath())
+  .option("--json", "output JSON")
+  .action(async (options) => {
+    const config = await loadConfig(options.config);
+    const state = await loadState(options.state);
+    const session = createBridgeSession(config, state, {
+      id: options.id,
+      agentId: options.agent,
+      title: options.title,
+      cwd: options.cwd,
+    });
+    await saveState(state, options.state);
+    options.json ? asJson(session) : console.log(session.id);
+  });
+async function attachSessionAction(sessionId: string, options: { channel: string; conversation: string; default?: boolean; config: string; state: string; json?: boolean }): Promise<void> {
+  const config = await loadConfig(options.config);
+  const state = await loadState(options.state);
+  const binding = attachBridgeSession(config, state, {
+    sessionId,
+    channelId: options.channel,
+    conversation: options.conversation,
+    makeDefault: Boolean(options.default),
+  });
+  await saveState(state, options.state);
+  options.json ? asJson(binding) : console.log(binding.id);
+}
+sessions
+  .command("attach")
+  .argument("<id>")
+  .description("Attach a session to a channel conversation")
+  .requiredOption("--channel <id>", "channel id")
+  .requiredOption("--conversation <id>", "external conversation id, such as a Telegram chat id")
+  .option("--default", "also make this the default session for the conversation")
+  .option("-c, --config <path>", "config path", defaultConfigPath())
+  .option("--state <path>", "state path", defaultStatePath())
+  .option("--json", "output JSON")
+  .action(attachSessionAction);
+sessions
+  .command("use")
+  .argument("<id>")
+  .description("Set the active session for a channel conversation")
+  .requiredOption("--channel <id>", "channel id")
+  .requiredOption("--conversation <id>", "external conversation id, such as a Telegram chat id")
+  .option("-c, --config <path>", "config path", defaultConfigPath())
+  .option("--state <path>", "state path", defaultStatePath())
+  .option("--json", "output JSON")
+  .action(async (id, options) => attachSessionAction(id, { ...options, default: true }));
+sessions
+  .command("detach")
+  .description("Detach the active session from a channel conversation")
+  .requiredOption("--channel <id>", "channel id")
+  .requiredOption("--conversation <id>", "external conversation id, such as a Telegram chat id")
+  .option("-c, --config <path>", "config path", defaultConfigPath())
+  .option("--state <path>", "state path", defaultStatePath())
+  .option("--json", "output JSON")
+  .action(async (options) => {
+    const config = await loadConfig(options.config);
+    const state = await loadState(options.state);
+    const binding = detachBridgeBinding(config, state, options.channel, options.conversation);
+    await saveState(state, options.state);
+    options.json ? asJson(binding || null) : console.log(binding ? `detached ${binding.id}` : "No binding.");
+  });
+for (const status of ["pause", "resume", "close"] as const) {
+  const nextStatus = status === "pause" ? "paused" : status === "resume" ? "active" : "closed";
+  sessions
+    .command(status)
+    .argument("<id>")
+    .description(`${status} a bridge session`)
+    .option("--state <path>", "state path", defaultStatePath())
+    .option("--json", "output JSON")
+    .action(async (id, options) => {
+      const state = await loadState(options.state);
+      const session = updateBridgeSessionStatus(state, id, nextStatus);
+      await saveState(state, options.state);
+      options.json ? asJson(session) : console.log(`${session.id} ${session.status}`);
+    });
+}
+sessions
+  .command("send")
+  .argument("<id>")
+  .argument("<text...>")
+  .description("Send one message directly to a bridge session")
+  .option("-c, --config <path>", "config path", defaultConfigPath())
+  .option("--state <path>", "state path", defaultStatePath())
+  .option("--json", "output JSON")
+  .action(async (id, textParts, options) => {
+    const config = await loadConfig(options.config);
+    const state = await loadState(options.state);
+    const message: BridgeMessage = {
+      id: `cli:${Date.now()}`,
+      channelId: "cli",
+      text: (textParts as string[]).join(" "),
+      receivedAt: new Date().toISOString(),
+    };
+    const result = await sendBridgeSessionMessage(config, state, id, message, { writeConsole: false });
+    await saveState(state, options.state);
+    if (options.json) asJson(result);
+    else process.stdout.write(result.agent?.stdout || result.agent?.stderr || result.message || "");
+    process.exitCode = result.agent?.exitCode ?? 0;
+  });
+sessions
+  .command("route-message")
+  .description("Route one synthetic message through session bindings")
+  .requiredOption("--channel <id>", "source channel id")
+  .requiredOption("--text <text>", "message text")
+  .option("--chat-id <id>", "chat id")
+  .option("--from <from>", "sender")
+  .option("--fallback-routes", "fall back to compatibility routes when no session is bound")
+  .option("-c, --config <path>", "config path", defaultConfigPath())
+  .option("--state <path>", "state path", defaultStatePath())
+  .option("--json", "output JSON")
+  .action(async (options) => {
+    const config = await loadConfig(options.config);
+    const state = await loadState(options.state);
+    const result = await dispatchMessageWithSessions(config, state, {
+      id: `cli:${Date.now()}`,
+      channelId: options.channel,
+      text: options.text,
+      chatId: options.chatId,
+      from: options.from,
+      receivedAt: new Date().toISOString(),
+    }, {
+      writeConsole: options.json ? false : undefined,
+      fallbackToRoutes: Boolean(options.fallbackRoutes),
+      persistState: async (nextState) => saveState(nextState, options.state),
+    });
+    await saveState(state, options.state);
+    options.json ? asJson(result) : printList(result.session ? [result.session] : result.routes || []);
+  });
+
 program
   .command("send")
   .argument("<channel>")
@@ -320,8 +588,9 @@ program
     const channel = config.channels[channelId];
     if (!channel) throw new Error(`Channel not found: ${channelId}`);
     let targetChat = chatId as string | undefined;
-    let text = (textParts as string[]).join(" ");
-    if (channel.kind !== "telegram" && !text && targetChat) {
+    const textArgParts = textParts as string[];
+    let text = textArgParts.join(" ");
+    if (channel.kind === "console" && !text && targetChat) {
       text = targetChat;
       targetChat = undefined;
     }
@@ -338,6 +607,23 @@ program
     if (channel.kind === "console") {
       if (options.json) asJson({ channel: channelId, text });
       else console.log(text);
+      return;
+    }
+    if (channel.kind === "imessage") {
+      if (!text && targetChat) {
+        const looksLikeHandle = targetChat.startsWith("+") || targetChat.includes("@") || imessageHandleAllowed(channel, targetChat);
+        if (looksLikeHandle) throw new Error("message text is required when an iMessage handle is provided");
+        text = targetChat;
+        targetChat = undefined;
+      }
+      targetChat = targetChat || channel.defaultHandle;
+      if (!targetChat) throw new Error("chatId/handle argument or channel.defaultHandle is required");
+      if (!text) throw new Error("message text is required");
+      if (!imessageHandleAllowed(channel, targetChat)) {
+        throw new Error(`iMessage handle ${targetChat} is not allowed for channel ${channel.id}`);
+      }
+      const result = await sendIMessage(channel, targetChat, text);
+      options.json ? asJson(result) : console.log("sent");
       return;
     }
     throw new Error(`Sending through ${channel.kind} is not implemented yet`);

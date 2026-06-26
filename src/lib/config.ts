@@ -37,6 +37,13 @@ const channelSchema = z.discriminatedUnion("kind", [
     label: z.string().optional(),
     enabled: z.boolean().optional(),
     account: z.string().optional(),
+    serviceName: z.string().optional(),
+    defaultHandle: z.string().optional(),
+    allowedHandles: z.array(z.string()).optional(),
+    allowAllHandles: z.boolean().optional(),
+    receiveMode: z.enum(["disabled", "chat-db"]).optional(),
+    chatDbPath: z.string().optional(),
+    pollLimit: z.number().int().positive().max(500).optional(),
   }),
 ]);
 

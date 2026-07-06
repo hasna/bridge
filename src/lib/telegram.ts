@@ -65,6 +65,17 @@ export function telegramChatAllowed(channel: TelegramChannelConfig, chatId: stri
   return Boolean(chatId && channel.allowedChatIds.includes(chatId));
 }
 
+/**
+ * Outbound broadcast allowlist (mirrors the inbound allowedChatIds pattern):
+ * a chat id may only be broadcast to when it is listed in broadcastChatIds or
+ * allowAllBroadcasts is explicitly enabled.
+ */
+export function telegramBroadcastAllowed(channel: TelegramChannelConfig, chatId: string | undefined): boolean {
+  if (channel.allowAllBroadcasts) return true;
+  if (!channel.broadcastChatIds?.length) return false;
+  return Boolean(chatId && channel.broadcastChatIds.includes(chatId));
+}
+
 export async function sendTelegramMessage(token: string, chatId: string, text: string): Promise<unknown> {
   const response = await fetch(telegramMethodUrl(token, "sendMessage"), {
     method: "POST",

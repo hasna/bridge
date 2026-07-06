@@ -17,6 +17,8 @@ const channelSchema = z.discriminatedUnion("kind", [
     allowedChatIds: z.array(z.string()).optional(),
     allowAllChats: z.boolean().optional(),
     pollTimeoutSeconds: z.number().int().positive().max(50).optional(),
+    broadcastChatIds: z.array(z.string()).optional(),
+    allowAllBroadcasts: z.boolean().optional(),
   }),
   z.object({
     id: z.string().min(1),

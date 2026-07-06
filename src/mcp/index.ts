@@ -4,6 +4,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import {
   attachBridgeSession,
+  broadcast,
+  getBroadcast,
+  listBroadcasts,
+  recordBroadcast,
   createBridgeSession,
   dispatchMessageWithSessions,
   doctor,
@@ -144,6 +148,40 @@ export function buildServer(): McpServer {
         receivedAt: new Date().toISOString(),
       });
       return text(result);
+    },
+  );
+
+  server.tool(
+    "bridge_broadcast",
+    {
+      channelId: z.string().describe("Channel to broadcast on (telegram or console)"),
+      text: z.string().describe("Message text to post to every target"),
+      targets: z.array(z.string()).optional().describe("Override target chat ids (defaults to the channel's broadcastChatIds)"),
+    },
+    async (args) => {
+      const config = await loadConfig();
+      const result = await broadcast(config, args.channelId, args.text, {
+        targets: args.targets,
+        writeConsole: false,
+      });
+      const state = await loadState();
+      recordBroadcast(state, result);
+      await saveState(state);
+      return text(result);
+    },
+  );
+
+  server.tool(
+    "bridge_broadcast_reports",
+    {
+      channelId: z.string().optional(),
+      limit: z.number().int().positive().optional(),
+      broadcastId: z.string().optional().describe("Return a single report by id"),
+    },
+    async (args) => {
+      const state = await loadState();
+      if (args.broadcastId) return text(getBroadcast(state, args.broadcastId) ?? `No broadcast report: ${args.broadcastId}`);
+      return text(listBroadcasts(state, { channelId: args.channelId, limit: args.limit ?? 20 }));
     },
   );
 

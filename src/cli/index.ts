@@ -38,11 +38,15 @@ import {
   loadState,
   saveState,
   attachBridgeSession,
+  broadcast,
   createBridgeSession,
   detachBridgeBinding,
   dispatchMessageWithSessions,
   getBridgeSession,
+  getBroadcast,
   listBridgeSessions,
+  listBroadcasts,
+  recordBroadcast,
   sendBridgeSessionMessage,
   updateBridgeSessionStatus,
   type AgentKind,
@@ -258,6 +262,8 @@ channels
   .option("--default-chat-id <id>", "default chat id for bridge send")
   .option("--allowed-chat-ids <ids>", "comma-separated allowed chat ids")
   .option("--allow-all-chats", "explicitly allow every chat that can reach this bot")
+  .option("--broadcast-chat-ids <ids>", "comma-separated outbound broadcast chat ids (channels/groups)")
+  .option("--allow-all-broadcasts", "explicitly allow broadcasting to any chat id")
   .option("-c, --config <path>", "config path", defaultConfigPath())
   .option("--json", "output JSON")
   .action(async (id, options) => {
@@ -273,6 +279,8 @@ channels
       defaultChatId: options.defaultChatId,
       allowedChatIds,
       allowAllChats: Boolean(options.allowAllChats),
+      broadcastChatIds: splitCsv(options.broadcastChatIds),
+      allowAllBroadcasts: Boolean(options.allowAllBroadcasts),
     }, options.config);
     options.json ? asJson(config.channels[id]) : console.log(`Added telegram channel ${id}`);
   });
@@ -826,6 +834,66 @@ program
       receivedAt: new Date().toISOString(),
     }, { writeConsole: options.json ? false : undefined });
     options.json ? asJson(result) : printList(result);
+  });
+
+program
+  .command("broadcast")
+  .argument("<channelId>", "channel to broadcast on (telegram or console)")
+  .argument("<text>", "message text to post to every target")
+  .description("Broadcast a message to a channel's outbound targets and report per-post delivery status")
+  .option("--targets <ids>", "comma-separated target chat ids (defaults to the channel's broadcastChatIds)")
+  .option("--no-record", "do not persist the delivery report in state")
+  .option("-c, --config <path>", "config path", defaultConfigPath())
+  .option("--state <path>", "state path", defaultStatePath())
+  .option("--json", "output JSON")
+  .action(async (channelId, text, options) => {
+    const config = await loadConfig(options.config);
+    const result = await broadcast(config, channelId, text, {
+      targets: splitCsv(options.targets),
+      writeConsole: options.json ? false : undefined,
+    });
+    if (options.record !== false) {
+      const state = await loadState(options.state);
+      recordBroadcast(state, result);
+      await saveState(state, options.state);
+    }
+    if (options.json) {
+      asJson(result);
+    } else {
+      console.log(`Broadcast ${result.id} on ${result.channelId}: ${result.sent} sent, ${result.failed} failed, ${result.skipped} skipped`);
+      for (const post of result.posts) {
+        console.log(`  ${post.target}: ${post.status}${post.messageId ? ` (message ${post.messageId})` : ""}${post.detail ? ` — ${post.detail}` : ""}`);
+      }
+    }
+    if (result.failed > 0) process.exitCode = 1;
+  });
+
+const broadcasts = program.command("broadcasts").description("Inspect recorded broadcast delivery reports");
+broadcasts
+  .command("list")
+  .option("--channel <id>", "filter by channel id")
+  .option("--limit <n>", "maximum reports to show", "20")
+  .option("--state <path>", "state path", defaultStatePath())
+  .option("--json", "output JSON")
+  .action(async (options) => {
+    const state = await loadState(options.state);
+    const reports = listBroadcasts(state, {
+      channelId: options.channel,
+      limit: parseNonNegativeInt(options.limit, "--limit") || undefined,
+    });
+    options.json ? asJson(reports) : printList(reports.map((r) => ({
+      id: r.id, channel: r.channelId, at: r.requestedAt, sent: r.sent, failed: r.failed, skipped: r.skipped,
+    })));
+  });
+broadcasts
+  .command("show")
+  .argument("<id>")
+  .option("--state <path>", "state path", defaultStatePath())
+  .action(async (id, options) => {
+    const state = await loadState(options.state);
+    const report = getBroadcast(state, id);
+    if (!report) throw new Error(`No broadcast report: ${id}`);
+    asJson(report);
   });
 
 await program.parseAsync(process.argv);

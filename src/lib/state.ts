@@ -1,7 +1,7 @@
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { bridgeHome } from "./paths.js";
-import type { BridgeBinding, BridgeSession, MessageLedgerEntry } from "../types.js";
+import type { BridgeBinding, BridgeSession, BroadcastResult, MessageLedgerEntry } from "../types.js";
 
 export const STATE_SCHEMA_VERSION = 2 as const;
 
@@ -12,6 +12,8 @@ export interface BridgeState {
   bindings: Record<string, BridgeBinding>;
   messageLedger: Record<string, MessageLedgerEntry>;
   cursors: Record<string, string | number>;
+  /** Per-post delivery reports from outbound broadcasts, keyed by broadcast id. */
+  broadcasts?: Record<string, BroadcastResult>;
 }
 
 export function defaultStatePath(): string {
@@ -26,6 +28,7 @@ export function emptyState(): BridgeState {
     bindings: {},
     messageLedger: {},
     cursors: {},
+    broadcasts: {},
   };
 }
 
@@ -39,6 +42,7 @@ function normalizeState(value: Partial<BridgeState>): BridgeState {
     bindings: value.bindings && typeof value.bindings === "object" ? value.bindings : {},
     messageLedger: value.messageLedger && typeof value.messageLedger === "object" ? value.messageLedger : {},
     cursors: value.cursors && typeof value.cursors === "object" ? value.cursors : {},
+    broadcasts: value.broadcasts && typeof value.broadcasts === "object" ? value.broadcasts : {},
   };
 }
 

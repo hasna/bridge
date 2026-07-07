@@ -59,6 +59,31 @@ bridge agents list
 bridge routes list
 ```
 
+## Broadcast
+
+Outbound one-to-many posting to Telegram channels/groups (distinct from the
+inbound routing surface). Broadcasting fails closed: a chat id can only be
+posted to when it is listed in the channel's `broadcastChatIds` outbound
+allowlist or `allowAllBroadcasts` is explicitly enabled (mirroring the inbound
+`allowedChatIds` pattern).
+
+```sh
+bridge channels add-telegram announce \
+  --token-env TELEGRAM_BOT_TOKEN \
+  --allowed-chat-ids 123456789 \
+  --broadcast-chat-ids -1002001,-1002002
+bridge broadcast announce "release v1.2.3 is live" --json
+bridge broadcasts list
+bridge broadcasts show BROADCAST_ID
+```
+
+Every broadcast returns a per-post delivery status (`sent` with the Telegram
+`message_id`, `failed` with the error detail, or `skipped` when the target is
+not allowlisted) and the report is persisted in `state.json` under
+`broadcasts` (most recent 200). The CLI exits non-zero when any post failed.
+From code: `broadcast(config, channelRef, message)` in `src/lib/broadcast.ts`.
+Slack/Discord broadcast targets are out of scope for now.
+
 Direct operations:
 
 ```sh
@@ -150,6 +175,8 @@ bridge agents add aicopilot-main --kind aicopilot --profile aicopilot-main
 - `bridge_session_send`
 - `bridge_session_route_message`
 - `bridge_route_message`
+- `bridge_broadcast`
+- `bridge_broadcast_reports`
 
 Use `bridge_session_route_message` for normal inbound channel behavior through
 session bindings. `bridge_route_message` remains for compatibility with explicit

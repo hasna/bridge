@@ -20,6 +20,10 @@ export interface TelegramChannelConfig extends BaseChannelConfig {
   allowedChatIds?: string[];
   allowAllChats?: boolean;
   pollTimeoutSeconds?: number;
+  /** Outbound broadcast allowlist: channel/group chat ids this bridge may post to. */
+  broadcastChatIds?: string[];
+  /** Explicitly allow broadcasting to any chat id (mirrors allowAllChats for inbound). */
+  allowAllBroadcasts?: boolean;
 }
 
 export interface ConsoleChannelConfig extends BaseChannelConfig {
@@ -209,4 +213,32 @@ export interface DoctorReport {
   ok: boolean;
   configPath: string;
   checks: DoctorCheck[];
+}
+
+// ─── Outbound broadcast (distribution apps plan) ──────────────────────────────
+
+export type BroadcastPostStatus = "sent" | "failed" | "skipped";
+
+export interface BroadcastPost {
+  /** Target chat id (Telegram channel/group) or "console". */
+  target: string;
+  status: BroadcastPostStatus;
+  /** Provider message id when the post was accepted (e.g. Telegram message_id). */
+  messageId?: string;
+  /** Failure or skip explanation. */
+  detail?: string;
+  sentAt?: string;
+}
+
+export interface BroadcastResult {
+  id: string;
+  channelId: string;
+  channelKind: ChannelKind;
+  text: string;
+  requestedAt: string;
+  total: number;
+  sent: number;
+  failed: number;
+  skipped: number;
+  posts: BroadcastPost[];
 }

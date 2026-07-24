@@ -73,6 +73,7 @@ const agentSchema = z.object({
   kind: z.enum(["codewith", "claude", "aicopilot", "shell"]),
   label: z.string().optional(),
   profileId: z.string().optional(),
+  fallbackProfileIds: z.array(z.string()).optional(),
   command: z.string().optional(),
   args: z.array(z.string()).optional(),
   cwd: z.string().optional(),

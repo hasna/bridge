@@ -36,6 +36,13 @@ export interface RunAgentDeps {
   spawn?: AgentSpawn;
   /** Reads the codewith `--output-last-message` file; injectable for tests. */
   readOutput?: (path: string) => Promise<string | undefined>;
+  /**
+   * Optional proactive usage probe (e.g. backed by `codewith usage`). When it
+   * resolves true for an auth profile, that profile is treated as exhausted and
+   * skipped before spawning, so rotation prefers a profile with remaining usage
+   * instead of burning a doomed request first. Injectable for tests.
+   */
+  checkUsageExhausted?: (authProfile: string | undefined) => Promise<boolean> | boolean;
 }
 
 /**
@@ -251,34 +258,64 @@ export function buildAccountsCommand(authProfile: string | undefined, codewithAr
 const SESSION_ID_KEYS = new Set([
   "session_id", "sessionid", "conversation_id", "conversationid", "thread_id", "threadid",
 ]);
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Nested containers whose `id` is a session id, e.g. {"session":{"id":"..."}}.
+const SESSION_CONTAINER_KEYS = new Set(["session", "thread", "conversation"]);
 
 function searchSessionId(value: unknown, depth = 0): string | undefined {
   if (depth > 6 || value === null || typeof value !== "object") return undefined;
-  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+  const obj = value as Record<string, unknown>;
+  for (const [key, raw] of Object.entries(obj)) {
     const norm = key.toLowerCase().replaceAll("-", "_");
+    // Explicit session-id keys are the strongest, least ambiguous signal.
     if (SESSION_ID_KEYS.has(norm) && typeof raw === "string" && raw) return raw;
-    if (norm === "id" && typeof raw === "string" && UUID_RE.test(raw)) return raw;
+    // A session/thread/conversation container object carrying an id/session_id.
+    if (SESSION_CONTAINER_KEYS.has(norm) && raw && typeof raw === "object") {
+      const nested = raw as Record<string, unknown>;
+      const id = nested["id"] ?? nested["session_id"] ?? nested["sessionId"];
+      if (typeof id === "string" && id) return id;
+    }
   }
-  for (const raw of Object.values(value as Record<string, unknown>)) {
+  for (const raw of Object.values(obj)) {
     const found = searchSessionId(raw, depth + 1);
     if (found) return found;
   }
   return undefined;
 }
 
-/** Extracts a codewith session id from `--json` JSONL event output. */
+// The canonical codewith --json session-start events. `thread.started` carries
+// `thread_id`; older/aliased shapes carry `session_id` (or a nested container).
+const SESSION_START_EVENT_TYPES = new Set([
+  "thread.started", "thread_started", "session.created", "session_created",
+  "session.started", "session_started", "session_configured",
+]);
+
+/**
+ * Extracts a codewith session id from `--json` JSONL event output. Prefers the
+ * canonical session-start event (`{"type":"thread.started","thread_id":"<uuid>"}`
+ * and its aliases) so we bind to the real session id rather than any later event
+ * that merely echoes an id; falls back to a generic scan for older shapes.
+ */
 export function extractCodewithSessionId(jsonl: string): string | undefined {
+  const events: Record<string, unknown>[] = [];
   for (const line of jsonl.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed[0] !== "{") continue;
-    let parsed: unknown;
     try {
-      parsed = JSON.parse(trimmed);
+      events.push(JSON.parse(trimmed) as Record<string, unknown>);
     } catch {
       continue;
     }
-    const found = searchSessionId(parsed);
+  }
+  // First pass: the explicit session-start event is the authoritative source.
+  for (const ev of events) {
+    const type = String(ev["type"] ?? ev["event"] ?? "").toLowerCase().replaceAll("-", "_");
+    if (!SESSION_START_EVENT_TYPES.has(type)) continue;
+    const found = searchSessionId(ev);
+    if (found) return found;
+  }
+  // Fallback: generic search across all events for older/unknown shapes.
+  for (const ev of events) {
+    const found = searchSessionId(ev);
     if (found) return found;
   }
   return undefined;
@@ -434,18 +471,167 @@ export function resolveDurableTarget(
   return { authProfile, sessionId };
 }
 
-async function runCodewithDurable(
+// ─── structured codewith --json error-event classification ────────────────────
+
+export interface SpawnLike {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}
+
+/** Parses each JSONL line of the given texts, skipping non-JSON noise. */
+function* jsonlEvents(...texts: string[]): Generator<Record<string, unknown>> {
+  for (const text of texts) {
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed[0] !== "{") continue;
+      try {
+        yield JSON.parse(trimmed) as Record<string, unknown>;
+      } catch {
+        // skip malformed line
+      }
+    }
+  }
+}
+
+/**
+ * If `ev` is a codewith `--json` *error* event, collapses its diagnostic fields
+ * (type/code/status/message and any nested `error` object) into one lowercased
+ * string for classification. Returns undefined for non-error events, so we
+ * classify structured events rather than raw-string matching the whole output.
+ */
+function errorEventText(ev: Record<string, unknown>): string | undefined {
+  const type = String(ev["type"] ?? ev["event"] ?? "").toLowerCase();
+  const err = ev["error"];
+  const isError = type.includes("error") || type.includes("fail")
+    || err !== undefined || ev["error_code"] !== undefined;
+  if (!isError) return undefined;
+  const parts: unknown[] = [type, ev["message"], ev["code"], ev["status"], ev["error_code"], ev["reason"]];
+  if (err && typeof err === "object") {
+    const eo = err as Record<string, unknown>;
+    parts.push(eo["type"], eo["code"], eo["message"], eo["status"], eo["reason"]);
+  } else {
+    parts.push(err);
+  }
+  return parts
+    .filter((p) => typeof p === "string" || typeof p === "number")
+    .map((p) => String(p))
+    .join(" ")
+    .toLowerCase();
+}
+
+const EXHAUSTION_PATTERN =
+  /(rate[ _-]?limit|ratelimited|too many requests|\b429\b|quota|usage[ _-]?(?:limit|cap)|insufficient[ _-]?quota|out of credit|no credit|credit balance|auth(?:entication)?[ _-]?(?:expired|failed|error|required|invalid)|unauthorized|token expired|\b401\b|\b403\b|exhausted|overloaded)/i;
+
+// ─── profile auth rotation on exhaustion ──────────────────────────────────────
+
+/**
+ * Whether a (failed) run hit a usage/quota/auth exhaustion signal. Detection is
+ * structured: only non-zero, non-timeout runs qualify, and the classification
+ * reads codewith `--json` *error events* (their type/code/message fields), not a
+ * brittle raw-string match over the whole stdout/stderr blob.
+ */
+export function isExhaustionSignal(result: SpawnLike): boolean {
+  if (result.timedOut) return false;
+  if (result.exitCode === 0) return false;
+  for (const ev of jsonlEvents(result.stdout, result.stderr)) {
+    const text = errorEventText(ev);
+    if (text && EXHAUSTION_PATTERN.test(text)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether a (failed) run indicates the resumed codewith session id no longer
+ * exists (rollout deleted / session expired / unknown thread), so the turn should
+ * be retried on a fresh session rather than failing forever. Reads structured
+ * `--json` error events, matching an error that names a session/thread/rollout
+ * subject together with a not-found/expired/invalid qualifier.
+ */
+export function isStaleSessionSignal(result: SpawnLike): boolean {
+  if (result.timedOut) return false;
+  if (result.exitCode === 0) return false;
+  for (const ev of jsonlEvents(result.stdout, result.stderr)) {
+    const text = errorEventText(ev);
+    if (!text) continue;
+    const hasSubject = /(session|thread|conversation|rollout)/.test(text);
+    const hasMissing = /(not[ _-]?found|no such|does ?n['o]?t exist|doesn't exist|unknown|no longer|missing|invalid|expired|gone|cannot be found|could not be found)/.test(text);
+    if (hasSubject && hasMissing) return true;
+  }
+  return false;
+}
+
+/**
+ * Ordered auth-rotation pool for an agent: [profileId, ...fallbackProfileIds],
+ * de-duplicated, validated to exist and match the agent kind. Throws on
+ * misconfiguration so it surfaces loudly rather than silently skipping.
+ */
+export function rotationProfiles(config: BridgeConfig, agent: AgentConfig): ProfileConfig[] {
+  const ids = [agent.profileId, ...(agent.fallbackProfileIds || [])].filter((id): id is string => Boolean(id));
+  const seen = new Set<string>();
+  const out: ProfileConfig[] = [];
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const profile = config.profiles[id];
+    if (!profile) throw new Error(`Agent ${agent.id} references unknown profile: ${id}`);
+    if (profile.agentKind !== agent.kind) {
+      throw new Error(`Profile ${profile.id} is for ${profile.agentKind}, not ${agent.kind}`);
+    }
+    out.push(profile);
+  }
+  return out;
+}
+
+/** The profile a session is currently pinned to (by active auth profile), or the pool head. */
+export function activeRotationProfile(config: BridgeConfig, agent: AgentConfig, session: BridgeSession | undefined): ProfileConfig | undefined {
+  const pool = rotationProfiles(config, agent);
+  const active = session?.agentSession?.authProfile;
+  if (active) {
+    const found = pool.find((profile) => profile.authProfile === active);
+    if (found) return found;
+  }
+  return pool[0];
+}
+
+/** The next profile after the one bound to `currentAuthProfile`, or undefined if there is no other. */
+export function nextRotationProfile(config: BridgeConfig, agent: AgentConfig, currentAuthProfile: string | undefined): ProfileConfig | undefined {
+  const pool = rotationProfiles(config, agent);
+  if (pool.length <= 1) return undefined;
+  const idx = pool.findIndex((profile) => profile.authProfile === currentAuthProfile);
+  if (idx === -1) return pool[0];
+  const next = pool[idx + 1];
+  return next && next.authProfile !== currentAuthProfile ? next : undefined;
+}
+
+/** Builds the rotation try-order starting from the currently active profile. */
+function rotationOrder(pool: ProfileConfig[], startAuthProfile: string | undefined): ProfileConfig[] {
+  if (!pool.length) return [];
+  let idx = startAuthProfile ? pool.findIndex((profile) => profile.authProfile === startAuthProfile) : 0;
+  if (idx < 0) idx = 0;
+  return pool.map((_, i) => pool[(idx + i) % pool.length]!);
+}
+
+async function runCodewithOnce(
   config: BridgeConfig,
   agent: AgentConfig,
   profile: ProfileConfig | undefined,
   input: AgentRunInput,
   deps: RunAgentDeps,
+  options: { forceFresh?: boolean } = {},
 ): Promise<AgentRunResult> {
   const spawn = deps.spawn || defaultAgentSpawn;
   const readOutput = deps.readOutput || defaultReadOutput;
+  const ref = input.session?.agentSession;
   const cwd = input.session?.cwd || agent.cwd || profile?.cwd;
   const env = buildAgentEnv(config, profile, agent);
-  const { authProfile, sessionId } = resolveDurableTarget(profile, input.session);
+  const authProfile = profile?.authProfile;
+  // forceFresh drops the stored id so codewith starts a brand-new session (used
+  // by stale-session self-heal when a resume target has gone away).
+  const sessionId = options.forceFresh
+    ? undefined
+    : authProfile ? ref?.providerSessions?.[authProfile] : ref?.refId;
 
   const dir = await mkdtemp(join(tmpdir(), "bridge-cw-"));
   const outputFile = join(dir, "last-message.txt");
@@ -476,10 +662,81 @@ async function runCodewithDurable(
       stdoutStructured: true,
       providerSessionId: capturedSessionId,
       authProfile,
+      exhausted: isExhaustionSignal(spawned),
     };
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }
+}
+
+/**
+ * Runs one codewith turn on a single profile with stale-session self-heal: if the
+ * run tried to resume a stored session id and codewith reports that session is
+ * gone (rollout deleted / expired / unknown), it retries once with a fresh
+ * session instead of failing the conversation forever.
+ */
+async function runCodewithProfileTurn(
+  config: BridgeConfig,
+  agent: AgentConfig,
+  profile: ProfileConfig | undefined,
+  input: AgentRunInput,
+  deps: RunAgentDeps,
+): Promise<AgentRunResult> {
+  const first = await runCodewithOnce(config, agent, profile, input, deps);
+  const ref = input.session?.agentSession;
+  const authProfile = profile?.authProfile;
+  const attemptedResume = Boolean(authProfile ? ref?.providerSessions?.[authProfile] : ref?.refId);
+  if (attemptedResume && isStaleSessionSignal(first)) {
+    const fresh = await runCodewithOnce(config, agent, profile, input, deps, { forceFresh: true });
+    fresh.staleSessionHealed = true;
+    return fresh;
+  }
+  return first;
+}
+
+/**
+ * Runs a durable codewith turn, rotating to the next auth profile when the
+ * active one hits exhaustion (rate-limit / quota / auth-expired). Each profile
+ * resumes its own codewith session id, so switching profiles accepts a fresh
+ * context on that profile the first time it is used (a codewith session created
+ * under one profile is not resumable under another). The turn continues on the
+ * new profile in the same call. Rotation is bounded to try each profile at most
+ * once. `contextReset` is set when the turn ends on a profile with no resumable
+ * session (fresh cross-profile context) or after a stale-session self-heal, so
+ * callers can tell the user their conversation context did not carry over.
+ */
+async function runCodewithDurable(
+  config: BridgeConfig,
+  agent: AgentConfig,
+  primaryProfile: ProfileConfig | undefined,
+  input: AgentRunInput,
+  deps: RunAgentDeps,
+): Promise<AgentRunResult> {
+  const pool = rotationProfiles(config, agent);
+  const start = activeRotationProfile(config, agent, input.session);
+  const order = rotationOrder(pool, start?.authProfile);
+  const candidates: (ProfileConfig | undefined)[] = order.length ? order : [primaryProfile];
+  const ref = input.session?.agentSession;
+
+  let last: AgentRunResult | undefined;
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    const authProfile = candidate?.authProfile;
+    // Proactively skip a profile a usage probe already reports as exhausted, so
+    // rotation prefers a profile with remaining usage rather than burning a
+    // doomed request. Never skip the last remaining candidate.
+    if (deps.checkUsageExhausted && authProfile && i < candidates.length - 1) {
+      if (await deps.checkUsageExhausted(authProfile)) continue;
+    }
+    const priorSessionId = authProfile ? ref?.providerSessions?.[authProfile] : ref?.refId;
+    const result = await runCodewithProfileTurn(config, agent, candidate, input, deps);
+    result.rotated = i > 0;
+    if ((i > 0 && !priorSessionId) || result.staleSessionHealed) result.contextReset = true;
+    last = result;
+    if (!result.exhausted) break;
+    // Exhausted: fall through to the next candidate profile (if any).
+  }
+  return last!;
 }
 
 export async function runAgent(

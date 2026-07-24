@@ -106,6 +106,21 @@ export async function doctor(configPath = defaultConfigPath(), statePath = defau
     });
   }
 
+  for (const agent of Object.values(config.agents)) {
+    if (!agent.fallbackProfileIds?.length) continue;
+    const problems = agent.fallbackProfileIds.filter((id) => {
+      const profile = config.profiles[id];
+      return !profile || profile.agentKind !== agent.kind;
+    });
+    checks.push({
+      name: `auth-rotation:${agent.id}`,
+      ok: problems.length === 0,
+      detail: problems.length === 0
+        ? `${1 + agent.fallbackProfileIds.length} profile(s) in rotation pool`
+        : `invalid fallback profile(s): ${problems.join(", ")}`,
+    });
+  }
+
   for (const route of config.routes) {
     checks.push({
       name: `route:${route.id}`,

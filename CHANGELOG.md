@@ -2,6 +2,44 @@
 
 All notable changes to `@hasna/bridge` are documented here.
 
+## 0.6.1
+
+### Hardened
+- **Exhaustion detection is now structured, not a raw-string match.**
+  `isExhaustionSignal` classifies codewith `--json` *error events* (their
+  type/code/message fields) plus exit code, so the assistant merely mentioning
+  "rate limit" or "429" in a normal reply no longer triggers a rotation.
+- **Cross-profile rotation resets context honestly.** When exhaustion rotates to
+  a backup profile (whose durable session is not resumable from the exhausted
+  one) — or a stale session is self-healed — the reply is prefixed with a
+  user-visible note (`CONTEXT_RESET_NOTE`) instead of pretending the switch was
+  seamless. An optional `checkUsageExhausted` probe (e.g. `codewith usage`) lets
+  rotation skip a known-exhausted profile before spawning it.
+- **Stale-session self-heal.** If resuming a stored `thread_id` fails because the
+  session/rollout is gone (`isStaleSessionSignal`), the turn retries once on a
+  fresh session instead of erroring forever, and marks the reply as context-reset.
+- **Canonical session-id capture.** `extractCodewithSessionId` prefers the
+  `{"type":"thread.started","thread_id":"<uuid>"}` session-start event (and its
+  aliases) over any later event that merely echoes an id.
+
+## 0.6.0
+
+### Added
+- **Automatic auth-profile rotation on exhaustion.** codewith agents accept an
+  ordered `fallbackProfileIds` rotation pool (`bridge agents add ... --profile A
+  --fallback-profile B C`). When the active profile hits a usage/quota/auth
+  exhaustion signal (rate-limit / quota / auth-expired / 429 / 401 / 403), the
+  durable adapter rotates to the next profile and continues the turn in the same
+  call. Each profile keeps its own codewith session id, so switching profiles
+  accepts a fresh context on that profile the first time it is used (a codewith
+  session created under one profile is not resumable under another); once
+  rotated, the bridge session is pinned to the healthy profile and later messages
+  resume its session directly. `bridge doctor` reports an `auth-rotation:<agent>`
+  check for pool validity.
+- `isExhaustionSignal`, `rotationProfiles`, `activeRotationProfile`, and
+  `nextRotationProfile` helpers, unit-tested including an end-to-end simulated
+  exhaustion that rotates and continues the session.
+
 ## 0.5.0
 
 ### Added
@@ -69,8 +107,9 @@ All notable changes to `@hasna/bridge` are documented here.
   chats can never provision sessions.
 - Auto-session provisioning no longer requires an explicit `defaultAgentId`: when
   a channel omits it, an inbound reply from an already-allowlisted chat (e.g. the
-  owner chat) falls back to the sole configured `codewith` agent (or the sole
-  agent of any kind), so the reply routes to an agent instead of the "no session"
-  help text. Ambiguous configs still refuse to guess.
+  owner chat) falls back to the sole configured `codewith` agent, so the reply
+  routes to an agent instead of the "no session" help text. Ambiguous configs
+  (several codewith agents) still refuse to guess; non-codewith agents are never
+  auto-selected.
 - Regression coverage that malformed / non-text Telegram updates and
   conversation-less messages are dropped without crashing the dispatcher.

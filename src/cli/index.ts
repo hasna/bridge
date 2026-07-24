@@ -386,6 +386,7 @@ agents
   .argument("<id>")
   .requiredOption("--kind <kind>", "codewith, claude, aicopilot, or shell")
   .option("--profile <id>", "profile id")
+  .option("--fallback-profile <id...>", "fallback profile id(s) for auth rotation on exhaustion")
   .option("--cwd <path>", "working directory")
   .option("--command <command>", "custom command")
   .option("--arg <arg...>", "custom args; {prompt} is replaced")
@@ -399,6 +400,7 @@ agents
       id,
       kind: options.kind as AgentKind,
       profileId: options.profile,
+      fallbackProfileIds: options.fallbackProfile,
       cwd: options.cwd,
       command: options.command,
       args: options.arg,

@@ -43,7 +43,9 @@ import {
   detachBridgeBinding,
   dispatchMessageWithSessions,
   handleInboundMessage,
+  notifyDeadLetter,
   reconcileInFlight,
+  upsertAgentWorkspace,
   DEFAULT_MAX_ATTEMPTS,
   getBridgeSession,
   getBroadcast,
@@ -124,13 +126,29 @@ async function runServe(options: { once?: boolean; interval?: string; json?: boo
     console.error(`[bridge] resume: ${report.sessions} session(s), ${report.bindings} binding(s), offsets=${JSON.stringify(report.offsets)}; in-flight processing=${report.processing.length} agent_completed=${report.agentCompleted.length} failed=${report.failed.length}`);
   }
 
+  // Lazily provisioned per-agent workspaces (own project folder + agent-<name>
+  // channel) are persisted back into the config file so restarts skip the
+  // provisioning CLI round-trips.
+  const provision = {
+    persist: async (agentId: string, workspace: Parameters<typeof upsertAgentWorkspace>[1]) => {
+      await upsertAgentWorkspace(agentId, workspace, options.config || defaultConfigPath());
+    },
+    log: (message: string) => console.error(message),
+  };
   const dispatchOptions = {
     writeConsole: (options.json ? false : undefined) as false | undefined,
     fallbackToRoutes: true,
     maxAttempts,
+    run: ((cfg, agentId, input) => runAgent(cfg, agentId, input, { provision })) as typeof runAgent,
     persistState: async (nextState: BridgeState) => saveState(nextState, statePath),
-    onDeadLetter: (_message: BridgeMessage, entry: MessageLedgerEntry) => {
+    onDeadLetter: async (message: BridgeMessage, entry: MessageLedgerEntry) => {
       console.error(`[bridge] dead-letter ${entry.id} after ${entry.attempts} attempt(s): ${entry.error || "unknown error"}`);
+      // Surface a clear error reply to the sender — never a silent dead-letter.
+      try {
+        await notifyDeadLetter(config, message, entry);
+      } catch (err) {
+        console.error(`[bridge] dead-letter notice failed for ${entry.id}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     },
   };
 
@@ -669,7 +687,14 @@ program
       text: (textParts as string[]).join(" "),
       receivedAt: new Date().toISOString(),
     };
-    const result = await runAgent(config, agentId, { message, route: { id: "cli", fromChannel: "cli", toAgent: agentId } });
+    const result = await runAgent(config, agentId, { message, route: { id: "cli", fromChannel: "cli", toAgent: agentId } }, {
+      provision: {
+        persist: async (id, workspace) => {
+          await upsertAgentWorkspace(id, workspace, options.config || defaultConfigPath());
+        },
+        log: (line: string) => console.error(line),
+      },
+    });
     options.json ? asJson(result) : process.stdout.write(result.stdout || result.stderr);
     process.exitCode = result.exitCode ?? 1;
   });

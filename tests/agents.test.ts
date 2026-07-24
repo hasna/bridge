@@ -46,9 +46,12 @@ const input = {
   route: { id: "r", fromChannel: "telegram", toAgent: "codewith" },
 };
 
-test("renders codewith command with auth profile and cwd", () => {
+test("renders codewith command with auth profile, cwd, and full YOLO flags", () => {
   const result = buildAgentCommand(baseConfig, "codewith", input);
-  expect(result.command).toEqual(["codewith", "--auth-profile", "account001", "--cd", "/repo", "exec", "hello"]);
+  expect(result.command).toEqual([
+    "codewith", "--auth-profile", "account001", "--cd", "/repo",
+    "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "hello",
+  ]);
   expect(result.cwd).toBe("/repo");
 });
 
@@ -128,7 +131,10 @@ test("session cwd overrides agent and profile cwd", () => {
   };
   const result = buildAgentCommand(baseConfig, "codewith", { ...input, session });
   expect(result.cwd).toBe("/session-repo");
-  expect(result.command).toEqual(["codewith", "--auth-profile", "account001", "--cd", "/session-repo", "exec", "hello"]);
+  expect(result.command).toEqual([
+    "codewith", "--auth-profile", "account001", "--cd", "/session-repo",
+    "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "hello",
+  ]);
 });
 
 test("reports compatibility resume cancel and close limitations for shell agents", () => {

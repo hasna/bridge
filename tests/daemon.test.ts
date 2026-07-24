@@ -241,7 +241,8 @@ test("running daemon reloads state before routing Telegram updates", async () =>
     ...testConfig(),
     profiles: {},
     agents: {
-      echo: { id: "echo", kind: "shell", command: "printf", args: ["bridge ok: {prompt}"] },
+      // Explicit cwd: keeps the spawned daemon hermetic (no real workspace provisioning).
+      echo: { id: "echo", kind: "shell", command: "printf", args: ["bridge ok: {prompt}"], cwd: tmpdir() },
     },
     routes: [],
   };

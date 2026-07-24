@@ -10,7 +10,7 @@ import type {
   SessionMessageResult,
 } from "../types.js";
 import type { BridgeState } from "./state.js";
-import { closeAgentSession, createAgentSessionRef, recordDurableSession, resolveAgent, runAgent, sendAgentSessionMessage } from "./agents.js";
+import { closeAgentSession, createAgentSessionRef, extractCodewithErrorMessage, filterAgentLogNoise, recordDurableSession, resolveAgent, runAgent, sendAgentSessionMessage } from "./agents.js";
 import { imessageHandleAllowed, sendIMessage } from "./imessage.js";
 import { routeMessage } from "./router.js";
 import { sendTelegramMessage, telegramChatAllowed, telegramToken } from "./telegram.js";
@@ -86,6 +86,43 @@ function agentReplyText(agent: AgentRunResult): string {
       : agent.stdout.trim();
   if (base && agent.contextReset) return `${CONTEXT_RESET_NOTE}\n\n${base}`;
   return base;
+}
+
+function truncateDetail(text: string, max = 700): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/**
+ * A CLEAR failure explanation for a failed agent run: prefers the structured
+ * codewith error event (unwrapping nested provider errors), then stderr with
+ * non-fatal tool log noise (e.g. shell_snapshot validation warnings) stripped,
+ * then any reply text, then a generic exit/timeout summary. This is what gets
+ * surfaced to the user instead of a silent dead-letter.
+ */
+export function agentFailureText(agent: AgentRunResult): string {
+  const structured = extractCodewithErrorMessage(agent.stdout) || extractCodewithErrorMessage(agent.stderr);
+  const stderrText = filterAgentLogNoise(agent.stderr);
+  const detail = structured
+    || stderrText
+    || agentReplyText(agent)
+    || (agent.timedOut ? "the agent run timed out" : `the agent exited with code ${agent.exitCode}`);
+  return truncateDetail(detail);
+}
+
+/**
+ * Sends an explicit error reply for a dead-lettered message, so a repeatedly
+ * failing agent run surfaces to the sender instead of dying silently in the
+ * ledger. Delivery reuses the normal (allow-listed) response path.
+ */
+export async function notifyDeadLetter(
+  config: BridgeConfig,
+  message: BridgeMessage,
+  entry: MessageLedgerEntry,
+  options: SessionMessageOptions = {},
+): Promise<boolean> {
+  const reason = entry.error?.trim() || "the agent run kept failing";
+  const text = `⚠️ I could not process that message (${entry.attempts} attempt${entry.attempts === 1 ? "" : "s"}): ${truncateDetail(reason)}`;
+  return deliverResponse(config, message, text, options);
 }
 
 function newSessionId(): string {
@@ -357,6 +394,8 @@ export async function sendBridgeSessionMessage(
   // message resumes the same codewith session rather than starting over.
   recordDurableSession(session, agent);
 
+  // Only a timeout or non-zero exit fails a run — stderr warnings (e.g.
+  // shell_snapshot validation noise) never do.
   if (agent.timedOut || (agent.exitCode !== null && agent.exitCode !== 0)) {
     return {
       kind: "session",
@@ -364,7 +403,7 @@ export async function sendBridgeSessionMessage(
       agent,
       deliveredResponse: false,
       status: "failed",
-      message: agent.stderr.trim() || agentReplyText(agent) || (agent.timedOut ? "Agent timed out" : `Agent exited ${agent.exitCode}`),
+      message: agentFailureText(agent),
     };
   }
 

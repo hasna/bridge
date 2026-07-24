@@ -78,6 +78,33 @@ export interface ProfileConfig {
   envPassthrough?: string[];
 }
 
+/**
+ * Per-agent provisioned workspace, following the station convention used by
+ * agent-ea / agent-marcus / agent-chief-of-staff: each agent owns
+ *   1. a projects-CLI project (`projects create agent-<name>`) whose folder is
+ *      the agent's run cwd, and
+ *   2. a conversations channel named `agent-<name>` for activity/claims/results.
+ * Provisioned lazily (and idempotently) on the agent's first run and persisted
+ * back into the bridge config so later runs skip the CLI round-trips.
+ */
+export interface AgentWorkspaceConfig {
+  /** projects-CLI project id (e.g. wks_...) backing this agent's folder. */
+  projectId?: string;
+  /** Absolute path of the agent's own project folder (used as the run cwd). */
+  path?: string;
+  /** conversations channel name for this agent (convention: agent-<name>). */
+  channel?: string;
+  /**
+   * ISO timestamp of when the `agent-<name>` conversations channel was
+   * confirmed (created or already existing). Tracked separately from
+   * {@link provisionedAt} so a transient conversations outage retries ONLY the
+   * channel on the next run without re-running project provisioning.
+   */
+  channelProvisionedAt?: string;
+  /** ISO timestamp of the last FULLY successful provisioning pass (project + channel). */
+  provisionedAt?: string;
+}
+
 export interface AgentConfig {
   id: string;
   kind: AgentKind;
@@ -98,6 +125,12 @@ export interface AgentConfig {
   /** Extra station env var names to pass through (see {@link ProfileConfig.envPassthrough}). */
   envPassthrough?: string[];
   timeoutMs?: number;
+  /**
+   * Provisioned per-agent project + channel (see {@link AgentWorkspaceConfig}).
+   * When no explicit cwd is configured for a run, the workspace folder is the
+   * agent's cwd. Populated lazily on first use.
+   */
+  workspace?: AgentWorkspaceConfig;
 }
 
 export interface RouteMatch {

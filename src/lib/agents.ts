@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentConfig, AgentRunInput, AgentRunResult, AgentSessionRef, BridgeConfig, BridgeMessage, BridgeSession, ProfileConfig } from "../types.js";
+import { ensureAgentWorkspace, type ProvisionDeps } from "./provision.js";
 
 export interface BuiltAgentCommand {
   command: string[];
@@ -43,6 +44,14 @@ export interface RunAgentDeps {
    * instead of burning a doomed request first. Injectable for tests.
    */
   checkUsageExhausted?: (authProfile: string | undefined) => Promise<boolean> | boolean;
+  /**
+   * Per-agent workspace provisioning hooks (projects/conversations exec,
+   * config persistence, workspace root). Provisioning only happens when this
+   * is provided — the CLI serve/ask entry points wire it (with `persist` so a
+   * lazily provisioned workspace lands in the config file); bare library calls
+   * and tests without it never touch provisioning CLIs or the filesystem.
+   */
+  provision?: ProvisionDeps;
 }
 
 /**
@@ -204,7 +213,7 @@ export function buildAgentCommand(config: BridgeConfig, agentId: string, input: 
     const base = ["codewith"];
     if (profile?.authProfile) base.push("--auth-profile", profile.authProfile);
     if (cwd) base.push("--cd", cwd);
-    base.push("exec", prompt);
+    base.push("exec", ...CODEWITH_YOLO_ARGS, prompt);
     return { command: base, cwd, env };
   }
 
@@ -240,17 +249,34 @@ export interface CodewithArgsInput {
 }
 
 /**
+ * Flags that make a bridge codewith run able to ACT (full YOLO mode):
+ * - `--skip-git-repo-check`: the agent cwd is its own project folder, not a
+ *   trusted git checkout, so codewith must not fail closed with
+ *   "Not inside a trusted directory".
+ * - `--dangerously-bypass-approvals-and-sandbox`: full bypass of approvals AND
+ *   the sandbox. Without it a non-interactive exec runs `sandbox: read-only,
+ *   approval: never` — view-only, unable to write/exec or leave its folder.
+ *   Bridge agents are intentionally full-yolo: they act anywhere on the station.
+ */
+export const CODEWITH_YOLO_ARGS = [
+  "--skip-git-repo-check",
+  "--dangerously-bypass-approvals-and-sandbox",
+] as const;
+
+/**
  * Builds the `codewith exec [...]` argv (invoked directly, NOT wrapped in
  * `accounts run codewith -p`). The accounts wrapper points CODEWITH_HOME at a
  * per-account directory, which forks the thread store per billing account; here
  * we keep one shared home and select the account with codewith's own
  * `--auth-profile`, so a thread created under account A is resumable under B.
+ * The run is full-YOLO ({@link CODEWITH_YOLO_ARGS}): trusted-directory check
+ * bypassed and approvals/sandbox fully bypassed so the agent can act.
  */
 export function buildCodewithExecArgs(input: CodewithArgsInput): string[] {
   const args = ["exec"];
   if (input.sessionId) args.push("resume", input.sessionId);
   if (input.authProfile) args.push("--auth-profile", input.authProfile);
-  args.push("--json", "--durable", "--skip-git-repo-check", "-o", input.outputFile);
+  args.push("--json", "--durable", ...CODEWITH_YOLO_ARGS, "-o", input.outputFile);
   if (input.cwd) args.push("-C", input.cwd);
   if (input.extraArgs?.length) args.push(...input.extraArgs);
   args.push(input.prompt);
@@ -278,6 +304,8 @@ export function resolveCodewithHome(baseEnv: Record<string, string | undefined> 
  * own `--auth-profile` flag (emitted by {@link buildCodewithExecArgs}). We always
  * pass an explicit `codewith exec [resume <id>]` argv — never a generic
  * resume/--last, which would cross-contaminate multiplexed conversations.
+ * Full-YOLO ({@link CODEWITH_YOLO_ARGS}) is carried by the exec argv, so the
+ * direct invocation still bypasses approvals/sandbox and can act.
  */
 export function buildCodewithCommand(codewithArgs: string[]): string[] {
   return ["codewith", ...codewithArgs];
@@ -391,6 +419,79 @@ export function extractCodewithLastMessage(jsonl: string): string | undefined {
   return last;
 }
 
+/**
+ * Non-fatal tool diagnostics interleaved in codewith stderr, e.g.
+ * `2026-07-24T14:24:27Z ERROR codex_core::shell_snapshot: Shell snapshot
+ * validation failed: ...`. These are warnings about auxiliary features — they
+ * must never fail a run nor be surfaced to the user as the failure reason.
+ *
+ * Deliberately narrow so GENUINE fatal stderr (e.g. `ERROR: invalid API key`)
+ * survives into user-facing failure text. Only three shapes are noise:
+ * 1. TRACE/DEBUG lines (timestamped or not) — never user-relevant;
+ * 2. timestamped tracing-crate log lines with a `module::path:` target
+ *    (the shell_snapshot warning shape), regardless of level;
+ * 3. codewith's `Reading additional input from stdin...` prompt echo.
+ */
+const AGENT_LOG_NOISE_PATTERN = new RegExp(
+  [
+    String.raw`^\s*(?:\d{4}-\d{2}-\d{2}[T ][0-9:.]+Z?\s+)?(?:TRACE|DEBUG)\b.*$`,
+    String.raw`^\s*\d{4}-\d{2}-\d{2}[T ][0-9:.]+Z?\s+(?:INFO|WARN|WARNING|ERROR)\s+[\w.\[\]-]+(?:::[\w.\[\]-]+)+:.*$`,
+    String.raw`^\s*Reading additional input from stdin\.{3}\s*$`,
+  ].join("|"),
+);
+
+/** Strips non-fatal tool log lines (shell_snapshot warnings etc.) from output,
+ * while KEEPING genuine fatal stderr such as `ERROR: invalid API key`. */
+export function filterAgentLogNoise(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .filter((line) => !AGENT_LOG_NOISE_PATTERN.test(line))
+    .join("\n")
+    .trim();
+}
+
+function coerceErrorDetail(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const trimmed = value.trim();
+  // codewith error events often carry a JSON-encoded provider error as the
+  // message; unwrap it (recursively) so the user sees the actual reason.
+  if (trimmed.startsWith("{")) {
+    try {
+      const nested = JSON.parse(trimmed) as Record<string, unknown>;
+      const inner = nested["error"];
+      const innerMessage = inner && typeof inner === "object"
+        ? (inner as Record<string, unknown>)["message"]
+        : nested["message"];
+      const unwrapped = coerceErrorDetail(typeof innerMessage === "string" ? innerMessage : undefined);
+      if (unwrapped) return unwrapped;
+    } catch {
+      // not JSON after all — use as-is
+    }
+  }
+  return trimmed;
+}
+
+/**
+ * Extracts a human-readable error message from codewith `--json` JSONL output
+ * (`{"type":"error",...}` / `{"type":"turn.failed","error":{...}}` events),
+ * unwrapping nested JSON-encoded provider errors. Used to surface a CLEAR error
+ * reply instead of raw JSONL or stderr noise.
+ */
+export function extractCodewithErrorMessage(jsonl: string): string | undefined {
+  let last: string | undefined;
+  for (const ev of jsonlEvents(jsonl)) {
+    const type = String(ev["type"] ?? ev["event"] ?? "").toLowerCase();
+    if (!type.includes("error") && !type.includes("fail")) continue;
+    const err = ev["error"];
+    const candidate = err && typeof err === "object"
+      ? (err as Record<string, unknown>)["message"]
+      : ev["message"] ?? err;
+    const detail = coerceErrorDetail(typeof candidate === "string" ? candidate : undefined);
+    if (detail) last = detail;
+  }
+  return last;
+}
+
 export function createAgentSessionRef(config: BridgeConfig, agentId: string): AgentSessionRef {
   const { agent, profile } = resolveAgent(config, agentId);
   const timestamp = new Date().toISOString();
@@ -482,6 +583,37 @@ export const defaultAgentSpawn: AgentSpawn = async (command, options) => {
 async function defaultReadOutput(path: string): Promise<string | undefined> {
   try {
     return await readFile(path, "utf-8");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolves the cwd a codewith run executes in. An explicit cwd (session, agent,
+ * profile) always wins; otherwise the agent's OWN provisioned project folder is
+ * used (lazily provisioning it — plus the agent's `agent-<name>` conversations
+ * channel — on first use). YOLO mode means the agent can still act anywhere on
+ * the station; the project folder is its home base, not a boundary.
+ *
+ * Provisioning is strictly opt-in via `deps.provision` (wired by the CLI
+ * serve/ask entry points): a bare library `runAgent` call must never spawn
+ * provisioning CLIs or touch the filesystem as a side effect. Provisioning
+ * problems never fail the run: worst case the run keeps the station default
+ * cwd, exactly as before.
+ */
+export async function resolveAgentCwd(
+  config: BridgeConfig,
+  agent: AgentConfig,
+  profile: ProfileConfig | undefined,
+  session: BridgeSession | undefined,
+  deps: RunAgentDeps = {},
+): Promise<string | undefined> {
+  const explicit = session?.cwd || agent.cwd || profile?.cwd;
+  if (explicit) return explicit;
+  if (!deps.provision) return undefined;
+  try {
+    const workspace = await ensureAgentWorkspace(config, agent.id, deps.provision);
+    return workspace.path;
   } catch {
     return undefined;
   }
@@ -653,7 +785,7 @@ async function runCodewithOnce(
   const spawn = deps.spawn || defaultAgentSpawn;
   const readOutput = deps.readOutput || defaultReadOutput;
   const ref = input.session?.agentSession;
-  const cwd = input.session?.cwd || agent.cwd || profile?.cwd;
+  const cwd = await resolveAgentCwd(config, agent, profile, input.session, deps);
   const env = buildAgentEnv(config, profile, agent);
   // Pin the shared codewith home so a per-profile HOME cannot fork the thread
   // store: every billing account resolves the SAME sessions/ store and can
@@ -791,6 +923,12 @@ export async function runAgent(
   }
 
   const built = buildAgentCommand(config, agentId, input);
+  // Every compatibility agent (codewith, claude, aicopilot, shell, custom
+  // command) executes from the agent's own provisioned project folder when no
+  // explicit cwd is configured (durable runs resolve it inside runCodewithOnce).
+  if (!built.cwd) {
+    built.cwd = await resolveAgentCwd(config, agent, profile, input.session, deps);
+  }
   const spawn = deps.spawn || defaultAgentSpawn;
   const spawned = await spawn(built.command, {
     cwd: built.cwd,

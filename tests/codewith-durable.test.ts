@@ -45,9 +45,15 @@ function state(): BridgeState {
 
 const SESSION_UUID = "11111111-2222-3333-4444-555555555555";
 
-test("buildCodewithExecArgs creates a durable json exec with an output file", () => {
+test("buildCodewithExecArgs creates a durable json exec with an output file and full YOLO flags", () => {
   const args = buildCodewithExecArgs({ prompt: "hello", outputFile: "/tmp/o.txt", cwd: "/repo" });
-  expect(args).toEqual(["exec", "--json", "--durable", "--skip-git-repo-check", "-o", "/tmp/o.txt", "-C", "/repo", "hello"]);
+  expect(args).toEqual([
+    "exec", "--json", "--durable",
+    // Trusted-directory check bypass + full approvals/sandbox bypass: the agent
+    // must be able to ACT (write/exec, escape its project folder), not view-only.
+    "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox",
+    "-o", "/tmp/o.txt", "-C", "/repo", "hello",
+  ]);
 });
 
 test("buildCodewithExecArgs resumes an explicit session id (never --last)", () => {
@@ -63,6 +69,9 @@ test("buildCodewithExecArgs selects the billing account with codewith's native -
   expect(args.slice(0, 3)).toEqual(["exec", "resume", SESSION_UUID]);
   expect(args).toContain("--auth-profile");
   expect(args[args.indexOf("--auth-profile") + 1]).toBe("account002");
+  // Full YOLO flags are still present on a resume-with-auth-profile turn.
+  expect(args).toContain("--skip-git-repo-check");
+  expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
   // Prompt stays last positional.
   expect(args[args.length - 1]).toBe("again");
 });

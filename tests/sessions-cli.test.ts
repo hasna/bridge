@@ -11,7 +11,8 @@ const config: BridgeConfig = {
   },
   profiles: {},
   agents: {
-    echo: { id: "echo", kind: "shell", command: "printf", args: ["reply:{prompt}"] },
+    // Explicit cwd: keeps the spawned CLI hermetic (no real workspace provisioning).
+    echo: { id: "echo", kind: "shell", command: "printf", args: ["reply:{prompt}"], cwd: tmpdir() },
   },
   routes: [],
 };

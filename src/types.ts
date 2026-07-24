@@ -175,7 +175,7 @@ export interface BridgeBinding {
   };
 }
 
-export type LedgerStatus = "processing" | "agent_completed" | "delivered" | "skipped" | "unauthorized" | "failed";
+export type LedgerStatus = "processing" | "agent_completed" | "delivered" | "skipped" | "unauthorized" | "failed" | "dead_letter";
 
 export interface MessageLedgerEntry {
   id: string;

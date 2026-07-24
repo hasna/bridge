@@ -42,6 +42,9 @@ import {
   createBridgeSession,
   detachBridgeBinding,
   dispatchMessageWithSessions,
+  handleInboundMessage,
+  reconcileInFlight,
+  DEFAULT_MAX_ATTEMPTS,
   getBridgeSession,
   getBroadcast,
   listBridgeSessions,
@@ -51,7 +54,9 @@ import {
   updateBridgeSessionStatus,
   type AgentKind,
   type BridgeMessage,
+  type BridgeState,
   type IMessageChannelConfig,
+  type MessageLedgerEntry,
   type TelegramChannelConfig,
 } from "../index.js";
 
@@ -98,7 +103,7 @@ function printList(items: Record<string, unknown> | unknown[]): void {
   for (const item of rows) console.log(JSON.stringify(item));
 }
 
-async function runServe(options: { once?: boolean; interval?: string; json?: boolean; state?: string; config?: string }): Promise<void> {
+async function runServe(options: { once?: boolean; interval?: string; json?: boolean; state?: string; config?: string; resume?: boolean; maxAttempts?: string }): Promise<void> {
   const config = await loadConfig(options.config);
   const telegramChannels = Object.values(config.channels).filter(
     (channel): channel is TelegramChannelConfig => channel.kind === "telegram" && channel.enabled !== false,
@@ -107,9 +112,28 @@ async function runServe(options: { once?: boolean; interval?: string; json?: boo
     (channel): channel is IMessageChannelConfig => channel.kind === "imessage" && channel.enabled !== false && channel.receiveMode === "chat-db",
   );
   const intervalMs = parseNonNegativeInt(options.interval || "1000", "--interval");
+  const maxAttempts = options.maxAttempts ? parseNonNegativeInt(options.maxAttempts, "--max-attempts") || DEFAULT_MAX_ATTEMPTS : DEFAULT_MAX_ATTEMPTS;
   if (!telegramChannels.length && !imessageChannels.length) throw new Error("No enabled pollable channels configured");
 
   const statePath = options.state || defaultStatePath();
+
+  if (options.resume) {
+    const resumeState = await loadState(statePath);
+    const report = reconcileInFlight(resumeState);
+    await saveState(resumeState, statePath);
+    console.error(`[bridge] resume: ${report.sessions} session(s), ${report.bindings} binding(s), offsets=${JSON.stringify(report.offsets)}; in-flight processing=${report.processing.length} agent_completed=${report.agentCompleted.length} failed=${report.failed.length}`);
+  }
+
+  const dispatchOptions = {
+    writeConsole: (options.json ? false : undefined) as false | undefined,
+    fallbackToRoutes: true,
+    maxAttempts,
+    persistState: async (nextState: BridgeState) => saveState(nextState, statePath),
+    onDeadLetter: (_message: BridgeMessage, entry: MessageLedgerEntry) => {
+      console.error(`[bridge] dead-letter ${entry.id} after ${entry.attempts} attempt(s): ${entry.error || "unknown error"}`);
+    },
+  };
+
   const errorCounts = new Map<string, number>();
   let stopping = false;
   const stop = () => {
@@ -127,29 +151,22 @@ async function runServe(options: { once?: boolean; interval?: string; json?: boo
         });
         errorCounts.delete(channel.id);
         for (const update of updates) {
+          if (stopping) break;
           const state = await loadState(statePath);
           const message = telegramUpdateToMessage(channel.id, update);
-          if (message) {
-            try {
-              const results = await dispatchMessageWithSessions(config, state, message, {
-                writeConsole: options.json ? false : undefined,
-                fallbackToRoutes: true,
-                persistState: async (nextState) => saveState(nextState, statePath),
-              });
-              if (results.ledger?.status === "failed" || results.ledger?.status === "processing" || results.ledger?.status === "agent_completed") {
-                await saveState(state, statePath);
-                throw new Error(results.ledger.error || `Message ${message.id} did not reach a terminal state`);
-              }
-              state.telegramOffsets[channel.id] = update.update_id + 1;
-              await saveState(state, statePath);
-              if (options.json) asJson(results);
-            } catch (err) {
-              await saveState(state, statePath);
-              throw err;
-            }
-          } else {
+          if (!message) {
             state.telegramOffsets[channel.id] = update.update_id + 1;
             await saveState(state, statePath);
+            continue;
+          }
+          const outcome = await handleInboundMessage(config, state, message, dispatchOptions);
+          if (outcome.advanceOffset) {
+            state.telegramOffsets[channel.id] = update.update_id + 1;
+            await saveState(state, statePath);
+            if (options.json) asJson(outcome.result);
+          } else {
+            await saveState(state, statePath);
+            throw new Error(outcome.error || `Message ${message.id} did not reach a terminal state`);
           }
         }
       } catch (err) {
@@ -171,24 +188,17 @@ async function runServe(options: { once?: boolean; interval?: string; json?: boo
         });
         errorCounts.delete(channel.id);
         for (const row of rows) {
+          if (stopping) break;
           const state = await loadState(statePath);
           const message = imessageRowToMessage(channel.id, row);
-          try {
-            const results = await dispatchMessageWithSessions(config, state, message, {
-              writeConsole: options.json ? false : undefined,
-              fallbackToRoutes: true,
-              persistState: async (nextState) => saveState(nextState, statePath),
-            });
-            if (results.ledger?.status === "failed" || results.ledger?.status === "processing" || results.ledger?.status === "agent_completed") {
-              await saveState(state, statePath);
-              throw new Error(results.ledger.error || `Message ${message.id} did not reach a terminal state`);
-            }
+          const outcome = await handleInboundMessage(config, state, message, dispatchOptions);
+          if (outcome.advanceOffset) {
             state.cursors[cursorKey] = row.rowId;
             await saveState(state, statePath);
-            if (options.json) asJson(results);
-          } catch (err) {
+            if (options.json) asJson(outcome.result);
+          } else {
             await saveState(state, statePath);
-            throw err;
+            throw new Error(outcome.error || `Message ${message.id} did not reach a terminal state`);
           }
         }
       } catch (err) {
@@ -667,6 +677,8 @@ program
   .description("Poll configured channels and route messages to agents")
   .option("--once", "poll once and exit")
   .option("--interval <ms>", "delay between polls", "1000")
+  .option("--resume", "reconcile durable in-flight state (bindings, sessions, offsets) before polling")
+  .option("--max-attempts <n>", "max delivery attempts before a message is dead-lettered", String(DEFAULT_MAX_ATTEMPTS))
   .option("-c, --config <path>", "config path", defaultConfigPath())
   .option("--state <path>", "state path", defaultStatePath())
   .option("--json", "emit routed message JSON")
@@ -702,16 +714,20 @@ daemon
   .option("--supervisor <type>", "process, launchd, systemd, or auto", "process")
   .option("--daemon-dir <path>", "daemon metadata/log directory")
   .option("--interval <ms>", "delay between polls", "1000")
+  .option("--no-resume", "do not reconcile durable in-flight state on start")
+  .option("--max-attempts <n>", "max delivery attempts before a message is dead-lettered")
   .option("-c, --config <path>", "config path", defaultConfigPath())
   .option("--state <path>", "state path", defaultStatePath())
   .option("--serve-json", "emit routed message JSON to daemon stdout log")
   .option("--json", "output JSON")
   .action(async (options) => {
     const intervalMs = parseNonNegativeInt(options.interval, "--interval");
+    const maxAttempts = options.maxAttempts ? parseNonNegativeInt(options.maxAttempts, "--max-attempts") : undefined;
     const supervisor = options.supervisor;
+    const common = { daemonDir: options.daemonDir, configPath: options.config, statePath: options.state, intervalMs, serveJson: options.serveJson, resume: options.resume, maxAttempts };
     const result = supervisor === "process"
-      ? await startProcessDaemon({ daemonDir: options.daemonDir, configPath: options.config, statePath: options.state, intervalMs, serveJson: options.serveJson })
-      : await startInstalledDaemon({ supervisor, daemonDir: options.daemonDir, configPath: options.config, statePath: options.state, intervalMs, serveJson: options.serveJson });
+      ? await startProcessDaemon(common)
+      : await startInstalledDaemon({ supervisor, ...common });
     options.json ? asJson(result) : console.log("started");
   });
 
@@ -737,6 +753,8 @@ daemon
   .option("--supervisor <type>", "process, launchd, systemd, or auto", "process")
   .option("--daemon-dir <path>", "daemon metadata/log directory")
   .option("--interval <ms>", "delay between polls")
+  .option("--no-resume", "do not reconcile durable in-flight state on restart")
+  .option("--max-attempts <n>", "max delivery attempts before a message is dead-lettered")
   .option("-c, --config <path>", "config path")
   .option("--state <path>", "state path")
   .option("--serve-json", "emit routed message JSON to daemon stdout log")
@@ -751,6 +769,8 @@ daemon
       statePath: options.state,
       intervalMs: options.interval ? parseNonNegativeInt(options.interval, "--interval") : undefined,
       serveJson: options.serveJson,
+      resume: options.resume,
+      maxAttempts: options.maxAttempts ? parseNonNegativeInt(options.maxAttempts, "--max-attempts") : undefined,
       timeoutMs: parseNonNegativeInt(options.timeoutMs, "--timeout-ms"),
       force: options.force,
     };

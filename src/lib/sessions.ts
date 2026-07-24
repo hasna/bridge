@@ -47,6 +47,15 @@ export interface DispatchMessageResult {
   ledger?: MessageLedgerEntry;
 }
 
+/** Ledger statuses that are final: a message in one of these is never reprocessed. */
+export const TERMINAL_LEDGER_STATUSES: readonly MessageLedgerEntry["status"][] = [
+  "delivered", "skipped", "unauthorized", "dead_letter",
+];
+
+export function isTerminalLedgerStatus(status: MessageLedgerEntry["status"]): boolean {
+  return TERMINAL_LEDGER_STATUSES.includes(status);
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -383,7 +392,7 @@ export async function routeSessionMessage(
 function beginLedger(state: BridgeState, message: BridgeMessage, conversationId?: string): { entry: MessageLedgerEntry; shouldProcess: boolean } {
   const id = ledgerId(message);
   const existing = state.messageLedger[id];
-  if (existing && ["delivered", "skipped", "unauthorized"].includes(existing.status)) {
+  if (existing && isTerminalLedgerStatus(existing.status)) {
     return { entry: existing, shouldProcess: false };
   }
   const timestamp = nowIso();
@@ -411,7 +420,7 @@ function completeLedger(entry: MessageLedgerEntry, status: MessageLedgerEntry["s
   entry.status = status;
   entry.sessionId = sessionId || entry.sessionId;
   entry.updatedAt = timestamp;
-  if (["delivered", "skipped", "unauthorized"].includes(status)) entry.terminalAt = timestamp;
+  if (isTerminalLedgerStatus(status)) entry.terminalAt = timestamp;
   if (error) entry.error = error;
   return entry;
 }

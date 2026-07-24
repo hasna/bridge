@@ -2,6 +2,28 @@
 
 All notable changes to `@hasna/bridge` are documented here.
 
+## 0.5.0
+
+### Added
+- **`bridge serve --resume` and resume-by-default daemon.** Serve can reconcile
+  durable in-flight state (bindings, sessions, persisted getUpdates offsets, and
+  interrupted ledger entries) before polling, logging a resume banner.
+  `bridge daemon start`/`restart` pass `--resume` by default (opt out with
+  `--no-resume`) so a restarted daemon reattaches channel bindings and resumes
+  in-flight work. The getUpdates offset is persisted per channel and only
+  advances on a terminal outcome, so a restart never loses or duplicates updates
+  (the message ledger dedupes already-processed update ids).
+- **Dead-letter for head-of-line poison.** A message whose delivery keeps failing
+  no longer blocks every newer update behind it forever. After `--max-attempts`
+  (default 5) it moves to a terminal `dead_letter` status, the offset advances,
+  and `onDeadLetter` logs it. `bridge serve`/`daemon` accept `--max-attempts`.
+- New `handleInboundMessage` / `reconcileInFlight` helpers centralize the
+  offset-advance decision and are unit-tested for replay-without-duplication and
+  poison-message handling.
+- Regression coverage that a per-conversation codewith `thread_id` survives a
+  state `saveState`/`loadState` restart and is resumed with `codewith exec resume
+  <thread_id>` on the next message.
+
 ## 0.4.0
 
 ### Added

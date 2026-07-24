@@ -2,6 +2,33 @@
 
 All notable changes to `@hasna/bridge` are documented here.
 
+## 0.4.0
+
+### Added
+- **Durable codewith sessions driven through `accounts`.** codewith agents now
+  run via `accounts run codewith -p <profile> -- exec --json --durable -o <file>`
+  so each conversation keeps a real codewith session id and resumes it with
+  `codewith exec resume <SESSION_ID>` on the next message and across restarts.
+  Session ids are stored per auth profile on the bridge session
+  (`agentSession.providerSessions`), because a codewith session is only resumable
+  under the profile that created it. The bridge never uses `accounts run --resume`
+  / codewith `--last` (which target the most-recent session for the profile and
+  would cross-contaminate multiplexed conversations).
+- Reply text is isolated from the JSONL event stream via the codewith
+  `--output-last-message` file (falling back to the parsed final assistant
+  event). Structured stdout is flagged and is never relayed to the user.
+
+### Security
+- `buildAgentEnv` no longer inherits the full station environment into the
+  code-executing agent. It now uses an explicit **allow-list** (PATH/HOME/locale,
+  XDG base dirs, and the `codewith`/`accounts`/`bun` toolchain prefixes) instead
+  of a deny-list, so station secrets that do not match a credential-shaped name —
+  `DATABASE_URL`, `AWS_ACCESS_KEY_ID`, `TELEGRAM_SESSION`, etc. — are dropped by
+  default rather than leaking. The bridge's own channel secrets and any
+  credential-shaped key are additionally stripped even if allow-listed. A tool
+  that needs another var gets it via profile/agent `env` (explicit values win) or
+  the new `envPassthrough` config (exact names / `PREFIX*` globs).
+
 ## 0.3.0
 
 ### Added

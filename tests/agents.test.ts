@@ -73,11 +73,19 @@ test("rejects profile kind mismatches", () => {
   expect(() => resolveAgent(config, "bad")).toThrow("not codewith");
 });
 
-test("creates explicit compatibility agent session refs", () => {
+test("creates durable agent session refs for codewith", () => {
   const ref = createAgentSessionRef(baseConfig, "codewith");
   expect(ref.kind).toBe("codewith");
+  expect(ref.mode).toBe("durable");
+  expect(ref.authProfile).toBe("account001");
+  expect(ref.providerSessions).toEqual({});
+});
+
+test("creates compatibility agent session refs for custom shell agents", () => {
+  const ref = createAgentSessionRef(baseConfig, "custom");
+  expect(ref.kind).toBe("shell");
   expect(ref.mode).toBe("compatibility");
-  expect(ref.detail).toContain("compatibility mode");
+  expect(ref.detail).toContain("shell command session");
 });
 
 test("sends session messages through the injectable runner", async () => {
@@ -122,9 +130,24 @@ test("session cwd overrides agent and profile cwd", () => {
   expect(result.command).toEqual(["codewith", "--auth-profile", "account001", "--cd", "/session-repo", "exec", "hello"]);
 });
 
-test("reports compatibility resume cancel and close limitations", () => {
+test("reports compatibility resume cancel and close limitations for shell agents", () => {
   const session: BridgeSession = {
     id: "ses_test",
+    agentId: "custom",
+    status: "active",
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString(),
+    agentSession: createAgentSessionRef(baseConfig, "custom"),
+  };
+
+  expect(resumeAgentSessionRef(session).supported).toBe(false);
+  expect(cancelAgentSession(session).supported).toBe(false);
+  expect(closeAgentSession(session).supported).toBe(false);
+});
+
+test("durable codewith sessions support resume and close", () => {
+  const session: BridgeSession = {
+    id: "ses_cw",
     agentId: "codewith",
     status: "active",
     createdAt: new Date(0).toISOString(),
@@ -132,7 +155,7 @@ test("reports compatibility resume cancel and close limitations", () => {
     agentSession: createAgentSessionRef(baseConfig, "codewith"),
   };
 
-  expect(resumeAgentSessionRef(session).supported).toBe(false);
+  expect(resumeAgentSessionRef(session).supported).toBe(true);
+  expect(closeAgentSession(session).supported).toBe(true);
   expect(cancelAgentSession(session).supported).toBe(false);
-  expect(closeAgentSession(session).supported).toBe(false);
 });

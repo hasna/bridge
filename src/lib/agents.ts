@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentConfig, AgentRunInput, AgentRunResult, AgentSessionRef, BridgeConfig, BridgeMessage, BridgeSession, ProfileConfig } from "../types.js";
 
 export interface BuiltAgentCommand {
@@ -14,6 +17,78 @@ export interface AgentSessionOperationResult {
 
 export interface AgentSessionSendOptions {
   run?: typeof runAgent;
+}
+
+/** Raw subprocess result, before any codewith-specific reply/session extraction. */
+export interface SpawnResult {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}
+
+export type AgentSpawn = (
+  command: string[],
+  options: { cwd?: string; env?: Record<string, string>; timeoutMs: number },
+) => Promise<SpawnResult>;
+
+export interface RunAgentDeps {
+  spawn?: AgentSpawn;
+  /** Reads the codewith `--output-last-message` file; injectable for tests. */
+  readOutput?: (path: string) => Promise<string | undefined>;
+}
+
+/**
+ * Explicit allow-list of the environment a code-executing agent (whose input is
+ * attacker-influenced inbound chat text) may inherit from the station process.
+ * Everything not on this list — or a configured passthrough — is dropped, so
+ * station secrets that do NOT happen to match a credential-shaped name pattern
+ * (e.g. `DATABASE_URL`, `AWS_ACCESS_KEY_ID`, `TELEGRAM_SESSION`) never leak. A
+ * tool that genuinely needs another var gets it via profile/agent `env` (explicit
+ * values) or `envPassthrough` (names / `PREFIX*` globs), never by default.
+ */
+const DEFAULT_ENV_ALLOWLIST = new Set<string>([
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD",
+  "TERM", "COLORTERM", "LANG", "LANGUAGE", "TZ", "HOSTNAME",
+  "TMPDIR", "TMP", "TEMP",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE",
+]);
+
+/** Allow-listed prefixes: locale, XDG base dirs, and the toolchains that resolve
+ * the `accounts` / `codewith` / `bun` binaries and their per-profile homes. */
+const DEFAULT_ENV_ALLOW_PREFIXES = [
+  "LC_", "XDG_", "CODEWITH_", "ACCOUNTS_", "BUN_",
+  "NVM_", "FNM_", "VOLTA_", "ASDF_", "MISE_",
+];
+
+/**
+ * Secondary guard applied to allow-listed / passed-through keys only, so an overly
+ * broad passthrough glob (e.g. `AWS_*`) still cannot smuggle a credential-shaped
+ * var through. Explicit profile/agent `env` values are exempt (operator intent).
+ */
+const SENSITIVE_ENV_PATTERN =
+  /(^|_)(TOKEN|SECRET|SECRETS|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|API_?KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|SESSION_KEY|AUTH_TOKEN|BEARER)$/i;
+
+interface EnvPassthroughSpec {
+  exact: Set<string>;
+  prefixes: string[];
+}
+
+/** Parses profile/agent `envPassthrough` entries into exact names and `PREFIX*` globs. */
+export function envPassthroughSpec(profile?: ProfileConfig, agent?: AgentConfig): EnvPassthroughSpec {
+  const exact = new Set<string>();
+  const prefixes: string[] = [];
+  for (const raw of [...(profile?.envPassthrough || []), ...(agent?.envPassthrough || [])]) {
+    if (raw.endsWith("*")) prefixes.push(raw.slice(0, -1));
+    else exact.add(raw);
+  }
+  return { exact, prefixes };
+}
+
+function envKeyAllowed(key: string, spec: EnvPassthroughSpec): boolean {
+  if (DEFAULT_ENV_ALLOWLIST.has(key) || spec.exact.has(key)) return true;
+  return DEFAULT_ENV_ALLOW_PREFIXES.some((p) => key.startsWith(p))
+    || spec.prefixes.some((p) => key.startsWith(p));
 }
 
 function renderCustomArgs(args: string[] | undefined, prompt: string): string[] {
@@ -33,9 +108,56 @@ function mergeEnv(profile?: ProfileConfig, agent?: AgentConfig): Record<string, 
   return Object.keys(env).length ? env : undefined;
 }
 
+/**
+ * Collects the channel secret env var names the bridge itself reads (Telegram
+ * bot tokens, webhook secrets). These are always stripped from agent env so a
+ * code-executing agent driven by untrusted chat text cannot exfiltrate them.
+ */
+export function bridgeSecretEnvNames(config: BridgeConfig): Set<string> {
+  const names = new Set<string>();
+  for (const channel of Object.values(config.channels)) {
+    if (channel.kind === "telegram") {
+      names.add(channel.botTokenEnv || "TELEGRAM_BOT_TOKEN");
+    }
+    if (channel.kind === "webhook" && channel.secretEnv) {
+      names.add(channel.secretEnv);
+    }
+  }
+  return names;
+}
+
+/**
+ * Builds the environment handed to a spawned agent using an explicit allow-list:
+ * only {@link DEFAULT_ENV_ALLOWLIST} / {@link DEFAULT_ENV_ALLOW_PREFIXES} vars and
+ * configured `envPassthrough` names survive from the station process. The bridge's
+ * own channel secrets and any credential-shaped key are additionally stripped even
+ * if allow-listed. Profile/agent `env` is then layered on top and always wins
+ * (this is how a tool re-introduces a specific key it needs). `profile.home` maps
+ * to HOME. The full station environment is never inherited.
+ */
+export function buildAgentEnv(
+  config: BridgeConfig,
+  profile: ProfileConfig | undefined,
+  agent: AgentConfig | undefined,
+  baseEnv: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const overrides = mergeEnv(profile, agent) || {};
+  const denied = bridgeSecretEnvNames(config);
+  const spec = envPassthroughSpec(profile, agent);
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (value === undefined) continue;
+    if (!envKeyAllowed(key, spec)) continue;      // allow-list: drop everything else
+    if (denied.has(key)) continue;                // never inherit the bridge's own secrets
+    if (SENSITIVE_ENV_PATTERN.test(key)) continue; // secondary guard on allow-listed keys
+    env[key] = value;
+  }
+  return { ...env, ...overrides };
+}
+
 function compatibilityDetail(kind: string): string {
   if (kind === "shell") return "shell command session; local bridge state is durable";
-  return "compatibility mode: this adapter invokes the current CLI one message at a time until a stable create/send/resume API is wired";
+  return "compatibility mode: this adapter invokes the current CLI one message at a time";
 }
 
 export function resolveAgent(config: BridgeConfig, agentId: string): { agent: AgentConfig; profile?: ProfileConfig } {
@@ -47,6 +169,15 @@ export function resolveAgent(config: BridgeConfig, agentId: string): { agent: Ag
     throw new Error(`Profile ${profile.id} is for ${profile.agentKind}, not ${agent.kind}`);
   }
   return { agent, profile };
+}
+
+/**
+ * Durable codewith runs are used when the agent is a codewith agent and no
+ * custom command override short-circuits the adapter. Durable runs capture a
+ * codewith session id and resume it across messages/restarts.
+ */
+export function isDurableCodewith(agent: AgentConfig, profile?: ProfileConfig): boolean {
+  return agent.kind === "codewith" && !agent.command && !profile?.command;
 }
 
 export function buildAgentCommand(config: BridgeConfig, agentId: string, input: AgentRunInput): BuiltAgentCommand {
@@ -81,23 +212,143 @@ export function buildAgentCommand(config: BridgeConfig, agentId: string, input: 
   return { command: ["sh", "-lc", prompt], cwd, env };
 }
 
+// ─── codewith durable command construction ────────────────────────────────────
+
+export interface CodewithArgsInput {
+  prompt: string;
+  outputFile: string;
+  cwd?: string;
+  /** Existing codewith session id to resume, if any. */
+  sessionId?: string;
+  extraArgs?: string[];
+}
+
+/** Builds the `codewith exec [...]` argv (without the accounts wrapper). */
+export function buildCodewithExecArgs(input: CodewithArgsInput): string[] {
+  const args = ["exec"];
+  if (input.sessionId) args.push("resume", input.sessionId);
+  args.push("--json", "--durable", "--skip-git-repo-check", "-o", input.outputFile);
+  if (input.cwd) args.push("-C", input.cwd);
+  if (input.extraArgs?.length) args.push(...input.extraArgs);
+  args.push(input.prompt);
+  return args;
+}
+
+/**
+ * Wraps a codewith argv in `accounts run` so the bridge drives codewith under an
+ * accounts-managed auth profile. Note: we always build an explicit
+ * `codewith exec [resume <id>]` argv here — we never use `accounts run --resume`,
+ * which maps to codewith's generic resume/--last (the most recent session for
+ * the profile) and would cross-contaminate multiplexed conversations.
+ */
+export function buildAccountsCommand(authProfile: string | undefined, codewithArgs: string[]): string[] {
+  const base = ["accounts", "run", "codewith"];
+  if (authProfile) base.push("-p", authProfile);
+  base.push("--", ...codewithArgs);
+  return base;
+}
+
+const SESSION_ID_KEYS = new Set([
+  "session_id", "sessionid", "conversation_id", "conversationid", "thread_id", "threadid",
+]);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function searchSessionId(value: unknown, depth = 0): string | undefined {
+  if (depth > 6 || value === null || typeof value !== "object") return undefined;
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    const norm = key.toLowerCase().replaceAll("-", "_");
+    if (SESSION_ID_KEYS.has(norm) && typeof raw === "string" && raw) return raw;
+    if (norm === "id" && typeof raw === "string" && UUID_RE.test(raw)) return raw;
+  }
+  for (const raw of Object.values(value as Record<string, unknown>)) {
+    const found = searchSessionId(raw, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/** Extracts a codewith session id from `--json` JSONL event output. */
+export function extractCodewithSessionId(jsonl: string): string | undefined {
+  for (const line of jsonl.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed[0] !== "{") continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const found = searchSessionId(parsed);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function coerceText(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    const parts = value.map((item) => coerceText(item)).filter((v): v is string => Boolean(v));
+    return parts.length ? parts.join("") : undefined;
+  }
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    return coerceText(obj["text"] ?? obj["content"] ?? obj["message"]);
+  }
+  return undefined;
+}
+
+/**
+ * Extracts the final assistant/agent message text from `--json` JSONL output as
+ * a fallback when the `--output-last-message` file is unavailable.
+ */
+export function extractCodewithLastMessage(jsonl: string): string | undefined {
+  let last: string | undefined;
+  for (const line of jsonl.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed[0] !== "{") continue;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const type = String(parsed["type"] || parsed["event"] || "").toLowerCase();
+    if (type.includes("error")) continue;
+    const role = String((parsed["role"] as string) || "").toLowerCase();
+    const isAssistant = role === "assistant"
+      || type.includes("assistant")
+      || type.includes("agent_message")
+      || type.includes("message");
+    if (!isAssistant) continue;
+    const text = coerceText(parsed["text"] ?? parsed["message"] ?? parsed["content"] ?? parsed["delta"]);
+    if (text) last = text;
+  }
+  return last;
+}
+
 export function createAgentSessionRef(config: BridgeConfig, agentId: string): AgentSessionRef {
-  const { agent } = resolveAgent(config, agentId);
+  const { agent, profile } = resolveAgent(config, agentId);
   const timestamp = new Date().toISOString();
+  const durable = isDurableCodewith(agent, profile);
   return {
     kind: agent.kind,
-    mode: "compatibility",
+    mode: durable ? "durable" : "compatibility",
+    authProfile: durable ? profile?.authProfile : undefined,
+    providerSessions: durable ? {} : undefined,
     createdAt: timestamp,
     updatedAt: timestamp,
-    detail: compatibilityDetail(agent.kind),
+    detail: durable
+      ? "durable codewith session: resumes a per-profile codewith session id across messages and restarts"
+      : compatibilityDetail(agent.kind),
   };
 }
 
 export function resumeAgentSessionRef(session: BridgeSession): AgentSessionOperationResult {
+  const durable = session.agentSession?.mode === "durable";
   return {
-    supported: session.agentSession?.mode === "durable",
+    supported: durable,
     ref: session.agentSession,
-    detail: session.agentSession?.mode === "durable"
+    detail: durable
       ? "durable agent session ref is available"
       : "compatibility sessions do not expose agent-side resume; bridge binding state is still durable",
   };
@@ -135,41 +386,149 @@ export async function sendAgentSessionMessage(
   });
 }
 
-export async function runAgent(config: BridgeConfig, agentId: string, input: AgentRunInput): Promise<AgentRunResult> {
-  const { agent } = resolveAgent(config, agentId);
-  const built = buildAgentCommand(config, agentId, input);
-  const started = Bun.spawn(built.command, {
-    cwd: built.cwd,
-    env: { ...process.env, ...(built.env || {}) },
+// ─── spawning ─────────────────────────────────────────────────────────────────
+
+export const defaultAgentSpawn: AgentSpawn = async (command, options) => {
+  const started = Bun.spawn(command, {
+    cwd: options.cwd,
+    env: options.env,
     stdout: "pipe",
     stderr: "pipe",
   });
 
   let timedOut = false;
-  let timeout: Timer | undefined;
-  const timeoutMs = agent.timeoutMs ?? 120_000;
-  const exitPromise = started.exited;
+  let timer: Timer | undefined;
   const result = await Promise.race([
-    exitPromise,
+    started.exited,
     new Promise<number | null>((resolve) => {
-      timeout = setTimeout(() => {
+      timer = setTimeout(() => {
         timedOut = true;
         started.kill();
         resolve(null);
-      }, timeoutMs);
+      }, options.timeoutMs);
     }),
   ]);
-  if (timeout) clearTimeout(timeout);
+  if (timer) clearTimeout(timer);
 
   const stdout = await new Response(started.stdout).text();
   const stderr = await new Response(started.stderr).text();
+  return { exitCode: result, stdout, stderr, timedOut };
+};
+
+async function defaultReadOutput(path: string): Promise<string | undefined> {
+  try {
+    return await readFile(path, "utf-8");
+  } catch {
+    return undefined;
+  }
+}
+
+/** Resolves the active auth profile + resumable session id for a durable run. */
+export function resolveDurableTarget(
+  profile: ProfileConfig | undefined,
+  session: BridgeSession | undefined,
+): { authProfile?: string; sessionId?: string } {
+  const ref = session?.agentSession;
+  const authProfile = ref?.authProfile || profile?.authProfile;
+  const sessionId = authProfile ? ref?.providerSessions?.[authProfile] : ref?.refId;
+  return { authProfile, sessionId };
+}
+
+async function runCodewithDurable(
+  config: BridgeConfig,
+  agent: AgentConfig,
+  profile: ProfileConfig | undefined,
+  input: AgentRunInput,
+  deps: RunAgentDeps,
+): Promise<AgentRunResult> {
+  const spawn = deps.spawn || defaultAgentSpawn;
+  const readOutput = deps.readOutput || defaultReadOutput;
+  const cwd = input.session?.cwd || agent.cwd || profile?.cwd;
+  const env = buildAgentEnv(config, profile, agent);
+  const { authProfile, sessionId } = resolveDurableTarget(profile, input.session);
+
+  const dir = await mkdtemp(join(tmpdir(), "bridge-cw-"));
+  const outputFile = join(dir, "last-message.txt");
+  try {
+    const codewithArgs = buildCodewithExecArgs({
+      prompt: input.message.text,
+      outputFile,
+      cwd,
+      sessionId,
+      extraArgs: agent.args || profile?.args,
+    });
+    const command = buildAccountsCommand(authProfile, codewithArgs);
+    const spawned = await spawn(command, { cwd, env, timeoutMs: agent.timeoutMs ?? 120_000 });
+
+    const fileReply = (await readOutput(outputFile))?.trim();
+    const replyText = fileReply || extractCodewithLastMessage(spawned.stdout);
+    const capturedSessionId = extractCodewithSessionId(spawned.stdout) || sessionId;
+
+    return {
+      agentId: agent.id,
+      command,
+      cwd,
+      exitCode: spawned.exitCode,
+      stdout: spawned.stdout,
+      stderr: spawned.stderr,
+      timedOut: spawned.timedOut,
+      replyText,
+      stdoutStructured: true,
+      providerSessionId: capturedSessionId,
+      authProfile,
+    };
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+export async function runAgent(
+  config: BridgeConfig,
+  agentId: string,
+  input: AgentRunInput,
+  deps: RunAgentDeps = {},
+): Promise<AgentRunResult> {
+  const { agent, profile } = resolveAgent(config, agentId);
+
+  if (isDurableCodewith(agent, profile)) {
+    return runCodewithDurable(config, agent, profile, input, deps);
+  }
+
+  const built = buildAgentCommand(config, agentId, input);
+  const spawn = deps.spawn || defaultAgentSpawn;
+  const spawned = await spawn(built.command, {
+    cwd: built.cwd,
+    env: buildAgentEnv(config, profile, agent),
+    timeoutMs: agent.timeoutMs ?? 120_000,
+  });
   return {
     agentId,
     command: built.command,
     cwd: built.cwd,
-    exitCode: result,
-    stdout,
-    stderr,
-    timedOut,
+    exitCode: spawned.exitCode,
+    stdout: spawned.stdout,
+    stderr: spawned.stderr,
+    timedOut: spawned.timedOut,
   };
+}
+
+/**
+ * Persists the durable provider session id (and active auth profile) captured by
+ * a run back onto the bridge session, so the next message resumes it. Returns
+ * true when the session ref changed.
+ */
+export function recordDurableSession(session: BridgeSession, agent: AgentRunResult): boolean {
+  if (!agent.providerSessionId) return false;
+  const ref = session.agentSession;
+  if (!ref || ref.mode !== "durable") return false;
+  const profileKey = agent.authProfile || ref.authProfile || "default";
+  ref.providerSessions = ref.providerSessions || {};
+  const changed = ref.providerSessions[profileKey] !== agent.providerSessionId
+    || ref.refId !== agent.providerSessionId
+    || ref.authProfile !== agent.authProfile;
+  ref.providerSessions[profileKey] = agent.providerSessionId;
+  ref.refId = agent.providerSessionId;
+  if (agent.authProfile) ref.authProfile = agent.authProfile;
+  ref.updatedAt = new Date().toISOString();
+  return changed;
 }

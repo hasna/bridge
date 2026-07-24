@@ -2,6 +2,36 @@
 
 All notable changes to `@hasna/bridge` are documented here.
 
+## 0.7.0
+
+### Fixed
+- **Auth-profile rotation now carries conversation context.** Durable codewith
+  runs previously went through `accounts run codewith -p <profile>`, which points
+  `CODEWITH_HOME` at a per-account directory and so forked the thread store per
+  billing account — a thread created under account A was unreadable under account
+  B, forcing a brand-new session (and a misleading "context was reset" note) on
+  every rotation. The adapter now invokes `codewith` directly against one shared,
+  stable `CODEWITH_HOME` and selects the paying account with codewith's native
+  `--auth-profile` flag. Threads/rollouts live under `CODEWITH_HOME/sessions`
+  keyed only by thread id, so a conversation keeps a single, auth-independent
+  `thread_id` that is resumed under whichever account pays. On exhaustion,
+  rotation switches **only** the billing account and resumes the **same** thread
+  (`codewith exec resume <thread_id> --auth-profile <next>`); it starts a fresh
+  thread only as a genuine stale-thread fallback.
+- **`CONTEXT_RESET_NOTE` is no longer shown for normal rotation.** It is prepended
+  only when the thread was genuinely unrecoverable (a self-healed stale session),
+  so users are told about a context reset only when one actually happened.
+
+### Changed (breaking, pre-1.0)
+- `AgentSessionRef` drops the per-profile `providerSessions` map; the conversation
+  thread is the single shared `refId`. `recordDurableSession` / `resolveDurableTarget`
+  now read/write `refId` directly. Persisted `0.6.x` state still loads and resumes
+  via the stored `refId`.
+- Removed the `buildAccountsCommand` export (the store-forking accounts wrapper).
+  New helpers: `buildCodewithCommand` (invokes `codewith` directly) and
+  `resolveCodewithHome` (resolves the shared home). `buildCodewithExecArgs` gains
+  an `authProfile` option that emits `--auth-profile`.
+
 ## 0.6.1
 
 ### Hardened

@@ -1,5 +1,5 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentConfig, AgentRunInput, AgentRunResult, AgentSessionRef, BridgeConfig, BridgeMessage, BridgeSession, ProfileConfig } from "../types.js";
 
@@ -225,15 +225,31 @@ export interface CodewithArgsInput {
   prompt: string;
   outputFile: string;
   cwd?: string;
-  /** Existing codewith session id to resume, if any. */
+  /** Existing codewith thread id to resume, if any. */
   sessionId?: string;
+  /**
+   * codewith auth profile (billing account) to run this turn under. Emitted as
+   * codewith's native `--auth-profile <name>` global flag, which selects the
+   * paying account WITHOUT changing the active profile — and, crucially, without
+   * changing the CODEWITH_HOME, so the resumed thread (see {@link sessionId}) is
+   * read from the SAME shared `sessions/` store. This is how a rotation switches
+   * only the billing account while keeping the conversation thread.
+   */
+  authProfile?: string;
   extraArgs?: string[];
 }
 
-/** Builds the `codewith exec [...]` argv (without the accounts wrapper). */
+/**
+ * Builds the `codewith exec [...]` argv (invoked directly, NOT wrapped in
+ * `accounts run codewith -p`). The accounts wrapper points CODEWITH_HOME at a
+ * per-account directory, which forks the thread store per billing account; here
+ * we keep one shared home and select the account with codewith's own
+ * `--auth-profile`, so a thread created under account A is resumable under B.
+ */
 export function buildCodewithExecArgs(input: CodewithArgsInput): string[] {
   const args = ["exec"];
   if (input.sessionId) args.push("resume", input.sessionId);
+  if (input.authProfile) args.push("--auth-profile", input.authProfile);
   args.push("--json", "--durable", "--skip-git-repo-check", "-o", input.outputFile);
   if (input.cwd) args.push("-C", input.cwd);
   if (input.extraArgs?.length) args.push(...input.extraArgs);
@@ -242,17 +258,29 @@ export function buildCodewithExecArgs(input: CodewithArgsInput): string[] {
 }
 
 /**
- * Wraps a codewith argv in `accounts run` so the bridge drives codewith under an
- * accounts-managed auth profile. Note: we always build an explicit
- * `codewith exec [resume <id>]` argv here — we never use `accounts run --resume`,
- * which maps to codewith's generic resume/--last (the most recent session for
- * the profile) and would cross-contaminate multiplexed conversations.
+ * Resolves the shared, stable codewith home for durable runs. codewith stores
+ * threads/rollouts under `CODEWITH_HOME/sessions` and billing accounts under
+ * `CODEWITH_HOME/auth_profiles`, so pinning ONE home — independent of any
+ * per-profile HOME — is what lets every billing account see and resume the same
+ * conversation thread. Resolves `$CODEWITH_HOME`, else `~/.codewith` (codewith's
+ * own default via find_codex_home()).
  */
-export function buildAccountsCommand(authProfile: string | undefined, codewithArgs: string[]): string[] {
-  const base = ["accounts", "run", "codewith"];
-  if (authProfile) base.push("-p", authProfile);
-  base.push("--", ...codewithArgs);
-  return base;
+export function resolveCodewithHome(baseEnv: Record<string, string | undefined> = process.env): string {
+  return baseEnv["CODEWITH_HOME"] || join(baseEnv["HOME"] || homedir(), ".codewith");
+}
+
+/**
+ * Builds the codewith command invoked directly — NOT wrapped in
+ * `accounts run codewith -p <profile>`. The accounts wrapper points
+ * CODEWITH_HOME at a per-account directory, forking the thread store per billing
+ * account (so a thread created under account A is invisible under account B).
+ * Instead we run one shared home and select the paying account with codewith's
+ * own `--auth-profile` flag (emitted by {@link buildCodewithExecArgs}). We always
+ * pass an explicit `codewith exec [resume <id>]` argv — never a generic
+ * resume/--last, which would cross-contaminate multiplexed conversations.
+ */
+export function buildCodewithCommand(codewithArgs: string[]): string[] {
+  return ["codewith", ...codewithArgs];
 }
 
 const SESSION_ID_KEYS = new Set([
@@ -371,11 +399,10 @@ export function createAgentSessionRef(config: BridgeConfig, agentId: string): Ag
     kind: agent.kind,
     mode: durable ? "durable" : "compatibility",
     authProfile: durable ? profile?.authProfile : undefined,
-    providerSessions: durable ? {} : undefined,
     createdAt: timestamp,
     updatedAt: timestamp,
     detail: durable
-      ? "durable codewith session: resumes a per-profile codewith session id across messages and restarts"
+      ? "durable codewith session: resumes one shared codewith thread across messages, restarts, and billing-account rotation"
       : compatibilityDetail(agent.kind),
   };
 }
@@ -467,7 +494,9 @@ export function resolveDurableTarget(
 ): { authProfile?: string; sessionId?: string } {
   const ref = session?.agentSession;
   const authProfile = ref?.authProfile || profile?.authProfile;
-  const sessionId = authProfile ? ref?.providerSessions?.[authProfile] : ref?.refId;
+  // The thread id is the single shared refId, resumable under ANY billing
+  // account (not keyed by auth profile).
+  const sessionId = ref?.refId;
   return { authProfile, sessionId };
 }
 
@@ -626,12 +655,17 @@ async function runCodewithOnce(
   const ref = input.session?.agentSession;
   const cwd = input.session?.cwd || agent.cwd || profile?.cwd;
   const env = buildAgentEnv(config, profile, agent);
+  // Pin the shared codewith home so a per-profile HOME cannot fork the thread
+  // store: every billing account resolves the SAME sessions/ store and can
+  // therefore resume the same conversation thread. An explicit CODEWITH_HOME
+  // (station/profile/agent env) is honoured; otherwise fall back to the shared
+  // station default.
+  env["CODEWITH_HOME"] = env["CODEWITH_HOME"] || resolveCodewithHome();
   const authProfile = profile?.authProfile;
-  // forceFresh drops the stored id so codewith starts a brand-new session (used
-  // by stale-session self-heal when a resume target has gone away).
-  const sessionId = options.forceFresh
-    ? undefined
-    : authProfile ? ref?.providerSessions?.[authProfile] : ref?.refId;
+  // The thread id is auth-independent: the same shared refId is resumed no matter
+  // which billing account pays. forceFresh drops it so codewith starts a brand-new
+  // thread (used by stale-session self-heal when the resume target has gone away).
+  const sessionId = options.forceFresh ? undefined : ref?.refId;
 
   const dir = await mkdtemp(join(tmpdir(), "bridge-cw-"));
   const outputFile = join(dir, "last-message.txt");
@@ -641,9 +675,10 @@ async function runCodewithOnce(
       outputFile,
       cwd,
       sessionId,
+      authProfile,
       extraArgs: agent.args || profile?.args,
     });
-    const command = buildAccountsCommand(authProfile, codewithArgs);
+    const command = buildCodewithCommand(codewithArgs);
     const spawned = await spawn(command, { cwd, env, timeoutMs: agent.timeoutMs ?? 120_000 });
 
     const fileReply = (await readOutput(outputFile))?.trim();
@@ -684,8 +719,7 @@ async function runCodewithProfileTurn(
 ): Promise<AgentRunResult> {
   const first = await runCodewithOnce(config, agent, profile, input, deps);
   const ref = input.session?.agentSession;
-  const authProfile = profile?.authProfile;
-  const attemptedResume = Boolean(authProfile ? ref?.providerSessions?.[authProfile] : ref?.refId);
+  const attemptedResume = Boolean(ref?.refId);
   if (attemptedResume && isStaleSessionSignal(first)) {
     const fresh = await runCodewithOnce(config, agent, profile, input, deps, { forceFresh: true });
     fresh.staleSessionHealed = true;
@@ -696,14 +730,18 @@ async function runCodewithProfileTurn(
 
 /**
  * Runs a durable codewith turn, rotating to the next auth profile when the
- * active one hits exhaustion (rate-limit / quota / auth-expired). Each profile
- * resumes its own codewith session id, so switching profiles accepts a fresh
- * context on that profile the first time it is used (a codewith session created
- * under one profile is not resumable under another). The turn continues on the
- * new profile in the same call. Rotation is bounded to try each profile at most
- * once. `contextReset` is set when the turn ends on a profile with no resumable
- * session (fresh cross-profile context) or after a stale-session self-heal, so
- * callers can tell the user their conversation context did not carry over.
+ * active one hits exhaustion (rate-limit / quota / auth-expired). Rotation
+ * switches ONLY the billing account: the conversation's single codewith thread
+ * lives in a shared, auth-independent store (see {@link resolveCodewithHome}), so
+ * the next profile resumes the SAME thread id and conversation context carries
+ * across the switch. The turn continues on the new profile in the same call, and
+ * rotation is bounded to try each profile at most once.
+ *
+ * `contextReset` is therefore NOT set for a normal rotation — context is
+ * preserved. It is set only when the thread is genuinely unrecoverable: a
+ * stale-session self-heal that had to start a brand-new thread because the stored
+ * one was gone/expired. That is the one case where callers must honestly tell the
+ * user their prior context did not carry over.
  */
 async function runCodewithDurable(
   config: BridgeConfig,
@@ -716,7 +754,6 @@ async function runCodewithDurable(
   const start = activeRotationProfile(config, agent, input.session);
   const order = rotationOrder(pool, start?.authProfile);
   const candidates: (ProfileConfig | undefined)[] = order.length ? order : [primaryProfile];
-  const ref = input.session?.agentSession;
 
   let last: AgentRunResult | undefined;
   for (let i = 0; i < candidates.length; i++) {
@@ -728,10 +765,12 @@ async function runCodewithDurable(
     if (deps.checkUsageExhausted && authProfile && i < candidates.length - 1) {
       if (await deps.checkUsageExhausted(authProfile)) continue;
     }
-    const priorSessionId = authProfile ? ref?.providerSessions?.[authProfile] : ref?.refId;
     const result = await runCodewithProfileTurn(config, agent, candidate, input, deps);
     result.rotated = i > 0;
-    if ((i > 0 && !priorSessionId) || result.staleSessionHealed) result.contextReset = true;
+    // Rotation resumes the SAME shared thread under the new billing account, so
+    // context is preserved — no reset. Only a genuine stale-thread self-heal
+    // (the stored thread was gone and a fresh one had to be started) drops it.
+    if (result.staleSessionHealed) result.contextReset = true;
     last = result;
     if (!result.exhausted) break;
     // Exhausted: fall through to the next candidate profile (if any).
@@ -770,20 +809,19 @@ export async function runAgent(
 }
 
 /**
- * Persists the durable provider session id (and active auth profile) captured by
- * a run back onto the bridge session, so the next message resumes it. Returns
- * true when the session ref changed.
+ * Persists the durable codewith thread id (and the active billing account)
+ * captured by a run back onto the bridge session, so the next message resumes the
+ * SAME thread. The thread id is stored once on `refId` — it is auth-independent
+ * and shared across billing accounts, not keyed per profile. `authProfile` merely
+ * records which account last paid, so the next turn starts on a profile that was
+ * working. Returns true when the ref changed.
  */
 export function recordDurableSession(session: BridgeSession, agent: AgentRunResult): boolean {
   if (!agent.providerSessionId) return false;
   const ref = session.agentSession;
   if (!ref || ref.mode !== "durable") return false;
-  const profileKey = agent.authProfile || ref.authProfile || "default";
-  ref.providerSessions = ref.providerSessions || {};
-  const changed = ref.providerSessions[profileKey] !== agent.providerSessionId
-    || ref.refId !== agent.providerSessionId
-    || ref.authProfile !== agent.authProfile;
-  ref.providerSessions[profileKey] = agent.providerSessionId;
+  const changed = ref.refId !== agent.providerSessionId
+    || (Boolean(agent.authProfile) && ref.authProfile !== agent.authProfile);
   ref.refId = agent.providerSessionId;
   if (agent.authProfile) ref.authProfile = agent.authProfile;
   ref.updatedAt = new Date().toISOString();

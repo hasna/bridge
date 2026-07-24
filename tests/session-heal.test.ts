@@ -27,10 +27,10 @@ const NEW_SID = "cccccccc-9999-8888-7777-666666666666";
 const message = { id: "m", channelId: "tg", text: "hi", receivedAt: new Date(0).toISOString() };
 const route = { id: "r", fromChannel: "tg", toAgent: "cw" };
 
-function durableSession(providerSessions: Record<string, string>): BridgeSession {
+function durableSession(refId?: string): BridgeSession {
   return {
     id: "s", agentId: "cw", status: "active", createdAt: "", updatedAt: "",
-    agentSession: { kind: "codewith", mode: "durable", authProfile: "account088", providerSessions },
+    agentSession: { kind: "codewith", mode: "durable", authProfile: "account088", refId },
   } as unknown as BridgeSession;
 }
 
@@ -64,7 +64,7 @@ test("runAgent self-heals a stale resumed session by retrying with a fresh sessi
     // Fresh session succeeds and yields a new id.
     return { exitCode: 0, stdout: '{"type":"thread.started","thread_id":"' + NEW_SID + '"}', stderr: "", timedOut: false };
   };
-  const result = await runAgent(config, "cw", { message, route, session: durableSession({ account088: OLD_SID }) }, {
+  const result = await runAgent(config, "cw", { message, route, session: durableSession(OLD_SID) }, {
     spawn, readOutput: async () => "fresh reply",
   });
 
@@ -87,7 +87,7 @@ test("runAgent does not retry-fresh when the resumed session simply errors for a
     calls++;
     return { exitCode: 1, stdout: '{"type":"error","error":{"type":"internal_error","message":"boom"}}', stderr: "", timedOut: false };
   };
-  const result = await runAgent(config, "cw", { message, route, session: durableSession({ account088: OLD_SID }) }, {
+  const result = await runAgent(config, "cw", { message, route, session: durableSession(OLD_SID) }, {
     spawn, readOutput: async () => undefined,
   });
   expect(result.staleSessionHealed).toBeUndefined();

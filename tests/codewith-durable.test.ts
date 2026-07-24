@@ -3,14 +3,15 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  buildAccountsCommand,
   buildAgentEnv,
+  buildCodewithCommand,
   buildCodewithExecArgs,
   dispatchMessageWithSessions,
   extractCodewithLastMessage,
   extractCodewithSessionId,
   loadState,
   recordDurableSession,
+  resolveCodewithHome,
   resolveDurableTarget,
   runAgent,
   saveState,
@@ -55,9 +56,26 @@ test("buildCodewithExecArgs resumes an explicit session id (never --last)", () =
   expect(args).not.toContain("--last");
 });
 
-test("buildAccountsCommand wraps codewith under an accounts profile", () => {
-  const cmd = buildAccountsCommand("account088", ["exec", "hi"]);
-  expect(cmd).toEqual(["accounts", "run", "codewith", "-p", "account088", "--", "exec", "hi"]);
+test("buildCodewithExecArgs selects the billing account with codewith's native --auth-profile", () => {
+  // Resuming the SAME thread while switching only the paying account: the flag
+  // that makes rotation carry context.
+  const args = buildCodewithExecArgs({ prompt: "again", outputFile: "/tmp/o.txt", sessionId: SESSION_UUID, authProfile: "account002" });
+  expect(args.slice(0, 3)).toEqual(["exec", "resume", SESSION_UUID]);
+  expect(args).toContain("--auth-profile");
+  expect(args[args.indexOf("--auth-profile") + 1]).toBe("account002");
+  // Prompt stays last positional.
+  expect(args[args.length - 1]).toBe("again");
+});
+
+test("buildCodewithCommand invokes codewith directly (no store-forking accounts wrapper)", () => {
+  const cmd = buildCodewithCommand(["exec", "hi"]);
+  expect(cmd).toEqual(["codewith", "exec", "hi"]);
+  expect(cmd).not.toContain("accounts");
+});
+
+test("resolveCodewithHome pins one shared home from env, else ~/.codewith", () => {
+  expect(resolveCodewithHome({ CODEWITH_HOME: "/shared/.codewith", HOME: "/home/x" })).toBe("/shared/.codewith");
+  expect(resolveCodewithHome({ HOME: "/home/x" })).toBe("/home/x/.codewith");
 });
 
 test("extractCodewithSessionId finds ids across event shapes", () => {
@@ -138,9 +156,9 @@ test("buildAgentEnv lets an explicit profile/agent env re-add a needed key", () 
   expect(env.ANTHROPIC_API_KEY).toBe("explicit");
 });
 
-test("resolveDurableTarget prefers the session's active profile session id", () => {
+test("resolveDurableTarget returns the shared thread id and the active billing account", () => {
   const session = {
-    agentSession: { kind: "codewith", mode: "durable", authProfile: "account088", providerSessions: { account088: SESSION_UUID } },
+    agentSession: { kind: "codewith", mode: "durable", authProfile: "account088", refId: SESSION_UUID },
   } as unknown as BridgeSession;
   expect(resolveDurableTarget(config.profiles.cw, session)).toEqual({ authProfile: "account088", sessionId: SESSION_UUID });
 });
@@ -162,8 +180,10 @@ test("runAgent durable path captures session id and isolates reply from JSONL st
     route: { id: "r", fromChannel: "tg", toAgent: "cw" },
   }, { spawn, readOutput: async (p) => outputs.get(p) });
 
-  expect(result.command.slice(0, 3)).toEqual(["accounts", "run", "codewith"]);
+  expect(result.command.slice(0, 2)).toEqual(["codewith", "exec"]);
+  expect(result.command).toContain("--auth-profile");
   expect(result.command).toContain("account088");
+  expect(result.command).not.toContain("accounts");
   expect(result.providerSessionId).toBe(SESSION_UUID);
   expect(result.stdoutStructured).toBe(true);
   expect(result.replyText).toBe("clean user reply");
@@ -174,7 +194,7 @@ test("runAgent durable path captures session id and isolates reply from JSONL st
 test("runAgent durable path resumes the stored session id on the next turn", async () => {
   const session = {
     id: "s", agentId: "cw", status: "active", createdAt: "", updatedAt: "",
-    agentSession: { kind: "codewith", mode: "durable", authProfile: "account088", providerSessions: { account088: SESSION_UUID } },
+    agentSession: { kind: "codewith", mode: "durable", authProfile: "account088", refId: SESSION_UUID },
   } as unknown as BridgeSession;
   let seen: string[] = [];
   const spawn: AgentSpawn = async (command) => {
@@ -191,16 +211,21 @@ test("runAgent durable path resumes the stored session id on the next turn", asy
   expect(seen).toContain(SESSION_UUID);
 });
 
-test("recordDurableSession persists the captured id per profile", () => {
+test("recordDurableSession persists the shared thread id and the active account", () => {
   const session = {
-    agentSession: { kind: "codewith", mode: "durable", authProfile: "account088", providerSessions: {} },
+    agentSession: { kind: "codewith", mode: "durable", authProfile: "account088" },
   } as unknown as BridgeSession;
   const agent = { providerSessionId: SESSION_UUID, authProfile: "account088" } as AgentRunResult;
   expect(recordDurableSession(session, agent)).toBe(true);
-  expect(session.agentSession?.providerSessions?.account088).toBe(SESSION_UUID);
   expect(session.agentSession?.refId).toBe(SESSION_UUID);
+  expect(session.agentSession?.authProfile).toBe("account088");
   // idempotent second call reports no change
   expect(recordDurableSession(session, agent)).toBe(false);
+
+  // Rotating the billing account keeps the SAME thread id, only re-points who pays.
+  expect(recordDurableSession(session, { providerSessionId: SESSION_UUID, authProfile: "account001" } as AgentRunResult)).toBe(true);
+  expect(session.agentSession?.refId).toBe(SESSION_UUID);
+  expect(session.agentSession?.authProfile).toBe("account001");
 });
 
 test("a stored per-conversation thread_id survives a state save/load restart and resumes", async () => {
@@ -225,7 +250,7 @@ test("a stored per-conversation thread_id survives a state save/load restart and
     const reloaded = await loadState(statePath);
     const binding = reloaded.bindings["tg::telegram:tg:1"];
     expect(binding).toBeDefined();
-    expect(reloaded.sessions[binding!.activeSessionId].agentSession?.providerSessions?.account088).toBe(SESSION_UUID);
+    expect(reloaded.sessions[binding!.activeSessionId].agentSession?.refId).toBe(SESSION_UUID);
 
     let seen: string[] = [];
     await dispatchMessageWithSessions(config, reloaded, {
@@ -263,5 +288,5 @@ test("durable reply isolation flows through dispatch to Telegram", async () => {
   expect(sentText).toBe("hello from codewith");
   const binding = bridgeState.bindings["tg::telegram:tg:1"];
   const session = bridgeState.sessions[binding!.activeSessionId];
-  expect(session.agentSession?.providerSessions?.account088).toBe(SESSION_UUID);
+  expect(session.agentSession?.refId).toBe(SESSION_UUID);
 });

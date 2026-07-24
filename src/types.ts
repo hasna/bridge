@@ -86,8 +86,9 @@ export interface AgentConfig {
   /**
    * Ordered fallback profile ids used for automatic auth rotation when the
    * active profile hits usage/quota/auth exhaustion. The rotation pool is
-   * [profileId, ...fallbackProfileIds]; each profile keeps its own codewith
-   * session id, so rotating starts (or resumes) that profile's own session.
+   * [profileId, ...fallbackProfileIds]. Rotation switches only the billing
+   * account and resumes the SAME codewith thread under it (shared thread store),
+   * so conversation context carries across the switch.
    */
   fallbackProfileIds?: string[];
   command?: string;
@@ -139,17 +140,20 @@ export type AgentSessionMode = "durable" | "compatibility";
 export interface AgentSessionRef {
   kind: AgentKind;
   mode: AgentSessionMode;
-  /** Provider session id for the currently active auth profile (durable mode). */
-  refId?: string;
-  /** Accounts/codewith auth profile the active provider session belongs to. */
-  authProfile?: string;
   /**
-   * Durable provider session ids keyed by auth profile. codewith durable
-   * sessions live under a single profile's CODEWITH_HOME and are only resumable
-   * under that same profile, so each profile keeps its own session id. Rotating
-   * to another profile (on exhaustion) starts a fresh session there.
+   * The single, auth-independent codewith `thread_id` for this conversation.
+   * codewith threads/rollouts live under a shared `CODEWITH_HOME/sessions` store
+   * keyed only by thread id — never by billing account — so this one id is
+   * resumable by ANY auth profile pointed at the same home. Rotating the billing
+   * account on exhaustion keeps this id; it does NOT fork per profile.
    */
-  providerSessions?: Record<string, string>;
+  refId?: string;
+  /**
+   * The codewith auth profile (billing account) currently active for this
+   * conversation. Switching it on rotation only changes who pays for the turn;
+   * {@link refId} (the thread) is unchanged, so context carries across the switch.
+   */
+  authProfile?: string;
   createdAt?: string;
   updatedAt?: string;
   detail?: string;

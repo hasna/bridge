@@ -2,6 +2,24 @@
 
 All notable changes to `@hasna/bridge` are documented here.
 
+## 0.6.0
+
+### Added
+- **Automatic auth-profile rotation on exhaustion.** codewith agents accept an
+  ordered `fallbackProfileIds` rotation pool (`bridge agents add ... --profile A
+  --fallback-profile B C`). When the active profile hits a usage/quota/auth
+  exhaustion signal (rate-limit / quota / auth-expired / 429 / 401 / 403), the
+  durable adapter rotates to the next profile and continues the turn in the same
+  call. Each profile keeps its own codewith session id, so switching profiles
+  accepts a fresh context on that profile the first time it is used (a codewith
+  session created under one profile is not resumable under another); once
+  rotated, the bridge session is pinned to the healthy profile and later messages
+  resume its session directly. `bridge doctor` reports an `auth-rotation:<agent>`
+  check for pool validity.
+- `isExhaustionSignal`, `rotationProfiles`, `activeRotationProfile`, and
+  `nextRotationProfile` helpers, unit-tested including an end-to-end simulated
+  exhaustion that rotates and continues the session.
+
 ## 0.5.0
 
 ### Added

@@ -83,6 +83,13 @@ export interface AgentConfig {
   kind: AgentKind;
   label?: string;
   profileId?: string;
+  /**
+   * Ordered fallback profile ids used for automatic auth rotation when the
+   * active profile hits usage/quota/auth exhaustion. The rotation pool is
+   * [profileId, ...fallbackProfileIds]; each profile keeps its own codewith
+   * session id, so rotating starts (or resumes) that profile's own session.
+   */
+  fallbackProfileIds?: string[];
   command?: string;
   args?: string[];
   cwd?: string;
@@ -219,8 +226,12 @@ export interface AgentRunResult {
   stdoutStructured?: boolean;
   /** Provider (codewith) session id created/resumed by this run, if any. */
   providerSessionId?: string;
-  /** Auth profile this run executed under. */
+  /** Auth profile this run executed under (the final one, after any rotation). */
   authProfile?: string;
+  /** True when the run hit a usage/quota/auth exhaustion signal. */
+  exhausted?: boolean;
+  /** True when the adapter rotated to a different auth profile during this turn. */
+  rotated?: boolean;
 }
 
 export interface RoutedMessageResult {

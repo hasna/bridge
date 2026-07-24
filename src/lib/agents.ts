@@ -434,7 +434,73 @@ export function resolveDurableTarget(
   return { authProfile, sessionId };
 }
 
-async function runCodewithDurable(
+// ─── profile auth rotation on exhaustion ──────────────────────────────────────
+
+const EXHAUSTION_PATTERN =
+  /(rate[ _-]?limit|ratelimited|too many requests|\b429\b|quota|usage[ _-]?(?:limit|cap)|insufficient[ _-]?quota|out of credit|no credit|credit balance|auth(?:entication)?[ _-]?(?:expired|failed|error|required)|token expired|session expired|\b401\b|\b403\b|exhausted)/i;
+
+/**
+ * Whether a (failed) run looks like a usage/quota/auth exhaustion signal rather
+ * than a normal error. Only non-zero, non-timeout runs qualify.
+ */
+export function isExhaustionSignal(result: { exitCode: number | null; stdout: string; stderr: string; timedOut: boolean }): boolean {
+  if (result.timedOut) return false;
+  if (result.exitCode === 0) return false;
+  return EXHAUSTION_PATTERN.test(`${result.stderr}\n${result.stdout}`);
+}
+
+/**
+ * Ordered auth-rotation pool for an agent: [profileId, ...fallbackProfileIds],
+ * de-duplicated, validated to exist and match the agent kind. Throws on
+ * misconfiguration so it surfaces loudly rather than silently skipping.
+ */
+export function rotationProfiles(config: BridgeConfig, agent: AgentConfig): ProfileConfig[] {
+  const ids = [agent.profileId, ...(agent.fallbackProfileIds || [])].filter((id): id is string => Boolean(id));
+  const seen = new Set<string>();
+  const out: ProfileConfig[] = [];
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const profile = config.profiles[id];
+    if (!profile) throw new Error(`Agent ${agent.id} references unknown profile: ${id}`);
+    if (profile.agentKind !== agent.kind) {
+      throw new Error(`Profile ${profile.id} is for ${profile.agentKind}, not ${agent.kind}`);
+    }
+    out.push(profile);
+  }
+  return out;
+}
+
+/** The profile a session is currently pinned to (by active auth profile), or the pool head. */
+export function activeRotationProfile(config: BridgeConfig, agent: AgentConfig, session: BridgeSession | undefined): ProfileConfig | undefined {
+  const pool = rotationProfiles(config, agent);
+  const active = session?.agentSession?.authProfile;
+  if (active) {
+    const found = pool.find((profile) => profile.authProfile === active);
+    if (found) return found;
+  }
+  return pool[0];
+}
+
+/** The next profile after the one bound to `currentAuthProfile`, or undefined if there is no other. */
+export function nextRotationProfile(config: BridgeConfig, agent: AgentConfig, currentAuthProfile: string | undefined): ProfileConfig | undefined {
+  const pool = rotationProfiles(config, agent);
+  if (pool.length <= 1) return undefined;
+  const idx = pool.findIndex((profile) => profile.authProfile === currentAuthProfile);
+  if (idx === -1) return pool[0];
+  const next = pool[idx + 1];
+  return next && next.authProfile !== currentAuthProfile ? next : undefined;
+}
+
+/** Builds the rotation try-order starting from the currently active profile. */
+function rotationOrder(pool: ProfileConfig[], startAuthProfile: string | undefined): ProfileConfig[] {
+  if (!pool.length) return [];
+  let idx = startAuthProfile ? pool.findIndex((profile) => profile.authProfile === startAuthProfile) : 0;
+  if (idx < 0) idx = 0;
+  return pool.map((_, i) => pool[(idx + i) % pool.length]!);
+}
+
+async function runCodewithOnce(
   config: BridgeConfig,
   agent: AgentConfig,
   profile: ProfileConfig | undefined,
@@ -443,9 +509,11 @@ async function runCodewithDurable(
 ): Promise<AgentRunResult> {
   const spawn = deps.spawn || defaultAgentSpawn;
   const readOutput = deps.readOutput || defaultReadOutput;
+  const ref = input.session?.agentSession;
   const cwd = input.session?.cwd || agent.cwd || profile?.cwd;
   const env = buildAgentEnv(config, profile, agent);
-  const { authProfile, sessionId } = resolveDurableTarget(profile, input.session);
+  const authProfile = profile?.authProfile;
+  const sessionId = authProfile ? ref?.providerSessions?.[authProfile] : ref?.refId;
 
   const dir = await mkdtemp(join(tmpdir(), "bridge-cw-"));
   const outputFile = join(dir, "last-message.txt");
@@ -476,10 +544,43 @@ async function runCodewithDurable(
       stdoutStructured: true,
       providerSessionId: capturedSessionId,
       authProfile,
+      exhausted: isExhaustionSignal(spawned),
     };
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }
+}
+
+/**
+ * Runs a durable codewith turn, rotating to the next auth profile when the
+ * active one hits exhaustion (rate-limit / quota / auth-expired). Each profile
+ * resumes its own codewith session id, so switching profiles accepts a fresh
+ * context on that profile the first time it is used (a codewith session created
+ * under one profile is not resumable under another). The turn continues on the
+ * new profile in the same call. Rotation is bounded to try each profile at most
+ * once.
+ */
+async function runCodewithDurable(
+  config: BridgeConfig,
+  agent: AgentConfig,
+  primaryProfile: ProfileConfig | undefined,
+  input: AgentRunInput,
+  deps: RunAgentDeps,
+): Promise<AgentRunResult> {
+  const pool = rotationProfiles(config, agent);
+  const start = activeRotationProfile(config, agent, input.session);
+  const order = rotationOrder(pool, start?.authProfile);
+  const candidates: (ProfileConfig | undefined)[] = order.length ? order : [primaryProfile];
+
+  let last: AgentRunResult | undefined;
+  for (let i = 0; i < candidates.length; i++) {
+    const result = await runCodewithOnce(config, agent, candidates[i], input, deps);
+    result.rotated = i > 0;
+    last = result;
+    if (!result.exhausted) break;
+    // Exhausted: fall through to the next candidate profile (if any).
+  }
+  return last!;
 }
 
 export async function runAgent(

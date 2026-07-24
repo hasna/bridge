@@ -29,10 +29,23 @@ const config: BridgeConfig = {
   routes: [],
 };
 
+const SID_A = "aaaaaaaa-1111-2222-3333-444444444444";
 const SID_B = "bbbbbbbb-2222-3333-4444-555555555555";
 
 function state(): BridgeState {
   return { schemaVersion: 2, telegramOffsets: {}, sessions: {}, bindings: {}, messageLedger: {}, cursors: {} };
+}
+
+/** The codewith auth profile (billing account) selected via the native flag. */
+function authProfileOf(command: string[]): string | undefined {
+  const i = command.indexOf("--auth-profile");
+  return i >= 0 ? command[i + 1] : undefined;
+}
+
+/** The thread id a `resume` argv is resuming, if any. */
+function resumedId(command: string[]): string | undefined {
+  const i = command.indexOf("resume");
+  return i >= 0 ? command[i + 1] : undefined;
 }
 
 test("isExhaustionSignal classifies codewith --json error events, not raw output strings", () => {
@@ -86,17 +99,17 @@ test("activeRotationProfile follows the session's pinned auth profile", () => {
 function rotatingSpawn(outputs: Map<string, string>, seen: string[][]): AgentSpawn {
   return async (command) => {
     seen.push(command);
-    const p = command[command.indexOf("-p") + 1];
+    const account = authProfileOf(command);
     const outFile = command[command.indexOf("-o") + 1]!;
-    if (p === "account088") {
-      // Primary profile is exhausted.
+    if (account === "account088") {
+      // Primary billing account is exhausted.
       return { exitCode: 1, stdout: '{"type":"error","message":"rate limit exceeded (429)"}', stderr: "usage limit reached", timedOut: false };
     }
-    // Fallback profile succeeds.
+    // Fallback account succeeds.
     outputs.set(outFile, "reply from B");
     return {
       exitCode: 0,
-      stdout: `{"type":"session.created","session_id":"${SID_B}"}\n{"type":"agent_message","role":"assistant","text":"noise"}`,
+      stdout: `{"type":"thread.started","thread_id":"${SID_B}"}\n{"type":"agent_message","role":"assistant","text":"noise"}`,
       stderr: "",
       timedOut: false,
     };
@@ -152,16 +165,18 @@ test("exhaustion rotation flows through dispatch and pins the session to the new
     sendTelegram: async (_t, _c, text) => { sentText = text; return { ok: true }; },
   });
 
-  // Rotation started a fresh session on the backup profile, so the user is told
-  // the context reset (no false claim of seamless cross-profile resume).
+  // First-ever turn rotated to the backup account. There was no prior thread to
+  // carry, so a fresh one is created — but this is NOT a "context reset" of an
+  // existing conversation, so no misleading note is shown.
   expect(sentText).toContain("reply from B");
-  expect(sentText).toContain(CONTEXT_RESET_NOTE);
+  expect(sentText).not.toContain(CONTEXT_RESET_NOTE);
   const binding = bridgeState.bindings["tg::telegram:tg:1"];
   const session = bridgeState.sessions[binding!.activeSessionId];
   expect(session.agentSession?.authProfile).toBe("account001");
-  expect(session.agentSession?.providerSessions?.account001).toBe(SID_B);
+  // One shared thread id, now billed to the backup account.
+  expect(session.agentSession?.refId).toBe(SID_B);
 
-  // The next message must now start on the fallback profile and resume its session.
+  // The next message must now start on the fallback account and resume the thread.
   seen.length = 0;
   let secondText = "";
   await dispatchMessageWithSessions(config, bridgeState, {
@@ -176,4 +191,69 @@ test("exhaustion rotation flows through dispatch and pins the session to the new
   expect(seen[0]).toContain(SID_B);
   // No further rotation -> no context-reset note on the follow-up reply.
   expect(secondText).not.toContain(CONTEXT_RESET_NOTE);
+});
+
+test("mid-conversation rotation resumes the SAME thread under the backup account (context carries, no reset note)", async () => {
+  // The headline guarantee: a conversation established under account A, then hit
+  // by exhaustion mid-stream, continues on account B by RESUMING the very same
+  // codewith thread id — so earlier context is preserved and no misleading
+  // "context was reset" note is shown.
+  process.env["TG_TOKEN"] = "test-token";
+  const bridgeState = state();
+  const outputs = new Map<string, string>();
+  const seen: string[][] = [];
+  let primaryExhausted = false;
+
+  const spawn: AgentSpawn = async (command) => {
+    seen.push(command);
+    const account = authProfileOf(command);
+    const outFile = command[command.indexOf("-o") + 1]!;
+    const resuming = resumedId(command);
+    if (account === "account088" && primaryExhausted) {
+      return { exitCode: 1, stdout: '{"type":"error","message":"rate limit exceeded (429)"}', stderr: "usage limit reached", timedOut: false };
+    }
+    // Success. codewith echoes the thread it actually ran: a resumed turn keeps
+    // the same id (shared, auth-independent store), a brand-new turn opens SID_A.
+    const threadId = resuming ?? SID_A;
+    outputs.set(outFile, resuming ? "reply on the resumed thread" : "first reply");
+    return { exitCode: 0, stdout: `{"type":"thread.started","thread_id":"${threadId}"}`, stderr: "", timedOut: false };
+  };
+  const run = (c: BridgeConfig, agentId: string, input: Parameters<typeof runAgent>[2]) =>
+    runAgent(c, agentId, input, { spawn, readOutput: async (p) => outputs.get(p) });
+
+  // Turn 1 on the primary account establishes the conversation thread.
+  let firstText = "";
+  await dispatchMessageWithSessions(config, bridgeState, {
+    id: "telegram:1", channelId: "tg", chatId: "1", text: "remember X", receivedAt: new Date(0).toISOString(),
+  }, { run, sendTelegram: async (_t, _c, text) => { firstText = text; return { ok: true }; } });
+
+  const binding = bridgeState.bindings["tg::telegram:tg:1"];
+  const session = bridgeState.sessions[binding!.activeSessionId];
+  expect(session.agentSession?.refId).toBe(SID_A);
+  expect(session.agentSession?.authProfile).toBe("account088");
+  expect(firstText).not.toContain(CONTEXT_RESET_NOTE);
+
+  // Turn 2: the primary account is now exhausted mid-conversation.
+  primaryExhausted = true;
+  seen.length = 0;
+  let secondText = "";
+  await dispatchMessageWithSessions(config, bridgeState, {
+    id: "telegram:2", channelId: "tg", chatId: "1", text: "what did I say?", receivedAt: new Date(0).toISOString(),
+  }, { run, sendTelegram: async (_t, _c, text) => { secondText = text; return { ok: true }; } });
+
+  // Two spawns this turn: exhausted primary, then the backup account.
+  expect(seen.length).toBe(2);
+  expect(authProfileOf(seen[0]!)).toBe("account088");
+  const backup = seen[1]!;
+  expect(authProfileOf(backup)).toBe("account001");
+  // The billing account changed BUT the backup RESUMED the SAME thread id — this
+  // is the proof that context carried across the switch.
+  expect(backup).toContain("resume");
+  expect(resumedId(backup)).toBe(SID_A);
+  // The conversation is still pinned to the same thread, now billed to the backup.
+  expect(session.agentSession?.refId).toBe(SID_A);
+  expect(session.agentSession?.authProfile).toBe("account001");
+  // Context preserved -> no misleading reset note; the reply came off the thread.
+  expect(secondText).not.toContain(CONTEXT_RESET_NOTE);
+  expect(secondText).toContain("reply on the resumed thread");
 });

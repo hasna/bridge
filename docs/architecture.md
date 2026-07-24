@@ -33,11 +33,21 @@ Runtime state uses `schemaVersion: 2` and is backward-compatible with the
 
 ## Profile Model
 
-Codewith profiles use `authProfile`. The durable adapter should use Codewith's
-background-agent surface where a noninteractive create/send/resume flow is
-available. `codewith --auth-profile <name> --cd <cwd> exec <prompt>` is
-compatibility mode because it is a one-shot process and does not preserve
-agent-side conversation context.
+Codewith profiles use `authProfile` (a codewith auth profile = a billing
+account). The durable adapter runs `codewith exec --durable [resume <thread_id>]
+--auth-profile <account>` directly against one **shared** `CODEWITH_HOME`. Because
+threads/rollouts live under `CODEWITH_HOME/sessions` keyed only by thread id — and
+`--auth-profile` switches the paying account without changing the home — a
+conversation keeps a single, auth-independent `thread_id` (`AgentSessionRef.refId`).
+Auth rotation on exhaustion therefore switches **only** the billing account and
+resumes that same thread, so context carries across the switch; a new thread is
+started only as a genuine stale-thread fallback. The adapter must NOT wrap this in
+`accounts run codewith -p <profile>`, which points `CODEWITH_HOME` at a per-account
+directory and forks the thread store per account (the old context-loss bug).
+
+`codewith --auth-profile <name> --cd <cwd> exec <prompt>` (no `--durable`) remains
+compatibility mode because it is a one-shot process that does not persist a
+resumable thread.
 
 Claude profiles can use `home` or custom env vars so multiple accounts do not
 share local state.

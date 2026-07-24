@@ -78,7 +78,8 @@ test("creates durable agent session refs for codewith", () => {
   expect(ref.kind).toBe("codewith");
   expect(ref.mode).toBe("durable");
   expect(ref.authProfile).toBe("account001");
-  expect(ref.providerSessions).toEqual({});
+  // One shared, auth-independent thread id (no per-profile session map).
+  expect(ref.refId).toBeUndefined();
 });
 
 test("creates compatibility agent session refs for custom shell agents", () => {

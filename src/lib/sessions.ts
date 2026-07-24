@@ -61,19 +61,22 @@ function nowIso(): string {
 }
 
 /**
- * User-visible note prepended when a turn ran on a fresh session that dropped the
- * conversation's prior context (auth-profile rotation on exhaustion, or a
- * self-healed stale session). Cross-profile durable sessions are not resumable,
- * so we surface the reset honestly rather than pretending it was seamless.
+ * User-visible note prepended ONLY when the conversation's codewith thread was
+ * genuinely unrecoverable — a self-healed stale session where the stored thread
+ * was gone/expired and a brand-new one had to be started. Normal auth-profile
+ * rotation on exhaustion does NOT set this: rotation resumes the same shared
+ * thread under a different billing account, so context carries over and claiming
+ * a reset would be misleading.
  */
 export const CONTEXT_RESET_NOTE =
-  "ℹ️ Note: the previous auth profile hit its usage limit, so I switched to a backup and started a new session. Earlier conversation context was not carried over.";
+  "ℹ️ Note: your previous session could no longer be resumed, so I started a new one. Earlier conversation context was not carried over.";
 
 /**
  * The user-facing reply text. Durable codewith runs emit JSONL on stdout, which
  * must never be relayed to the user; the isolated reply comes from replyText.
- * When the run reset context (rotation / stale-session self-heal) a note is
- * prepended so the reset is visible to the user.
+ * When the run genuinely reset context (stale-session self-heal only) a note is
+ * prepended so the reset is visible to the user; normal rotation carries context
+ * and prepends nothing.
  */
 function agentReplyText(agent: AgentRunResult): string {
   const base = agent.replyText !== undefined

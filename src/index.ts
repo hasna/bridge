@@ -6,6 +6,7 @@ export * from "./lib/daemon.js";
 export * from "./lib/doctor.js";
 export * from "./lib/imessage.js";
 export * from "./lib/paths.js";
+export * from "./lib/provision.js";
 export * from "./lib/router.js";
 export * from "./lib/serve.js";
 export * from "./lib/sessions.js";

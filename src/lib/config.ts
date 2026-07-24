@@ -1,7 +1,7 @@
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { z } from "zod";
-import { CONFIG_VERSION, type AgentConfig, type BridgeConfig, type ChannelConfig, type ProfileConfig, type RouteConfig } from "../types.js";
+import { CONFIG_VERSION, type AgentConfig, type AgentWorkspaceConfig, type BridgeConfig, type ChannelConfig, type ProfileConfig, type RouteConfig } from "../types.js";
 import { defaultConfigPath } from "./paths.js";
 
 const REDACTED_VALUE = "[redacted]";
@@ -68,6 +68,13 @@ const profileSchema = z.object({
   envPassthrough: z.array(z.string()).optional(),
 });
 
+const agentWorkspaceSchema = z.object({
+  projectId: z.string().optional(),
+  path: z.string().optional(),
+  channel: z.string().optional(),
+  provisionedAt: z.string().optional(),
+});
+
 const agentSchema = z.object({
   id: z.string().min(1),
   kind: z.enum(["codewith", "claude", "aicopilot", "shell"]),
@@ -80,6 +87,7 @@ const agentSchema = z.object({
   env: envSchema.optional(),
   envPassthrough: z.array(z.string()).optional(),
   timeoutMs: z.number().int().positive().optional(),
+  workspace: agentWorkspaceSchema.optional(),
 });
 
 const routeSchema = z.object({
@@ -185,6 +193,23 @@ export async function upsertProfile(profile: ProfileConfig, configPath = default
 export async function upsertAgent(agent: AgentConfig, configPath = defaultConfigPath()): Promise<BridgeConfig> {
   const config = await loadConfig(configPath);
   config.agents[agent.id] = agent;
+  await saveConfig(config, configPath);
+  return config;
+}
+
+/**
+ * Persists a lazily provisioned agent workspace (project id / folder / channel)
+ * back into the config file, so later runs skip the provisioning CLI calls.
+ */
+export async function upsertAgentWorkspace(
+  agentId: string,
+  workspace: AgentWorkspaceConfig,
+  configPath = defaultConfigPath(),
+): Promise<BridgeConfig> {
+  const config = await loadConfig(configPath);
+  const agent = config.agents[agentId];
+  if (!agent) throw new Error(`Agent not found: ${agentId}`);
+  agent.workspace = { ...agent.workspace, ...workspace };
   await saveConfig(config, configPath);
   return config;
 }

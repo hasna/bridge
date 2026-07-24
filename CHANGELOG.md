@@ -18,5 +18,10 @@ All notable changes to `@hasna/bridge` are documented here.
 ### Hardened
 - Auto-session provisioning is gated on channel authorization, so unauthorized
   chats can never provision sessions.
+- Auto-session provisioning no longer requires an explicit `defaultAgentId`: when
+  a channel omits it, an inbound reply from an already-allowlisted chat (e.g. the
+  owner chat) falls back to the sole configured `codewith` agent (or the sole
+  agent of any kind), so the reply routes to an agent instead of the "no session"
+  help text. Ambiguous configs still refuse to guess.
 - Regression coverage that malformed / non-text Telegram updates and
   conversation-less messages are dropped without crashing the dispatcher.

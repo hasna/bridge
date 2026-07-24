@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
   dispatchMessageWithSessions,
   ensureConversationBinding,
+  resolveAutoAgentId,
   telegramUpdateToMessage,
   type AgentRunResult,
   type BridgeConfig,
@@ -123,6 +124,55 @@ test("ensureConversationBinding throws on a misconfigured default agent", () => 
   expect(() => ensureConversationBinding(badConfig, state(), {
     id: "telegram:1", channelId: "tg", chatId: "1", text: "x", receivedAt: new Date(0).toISOString(),
   })).toThrow("defaultAgentId not found");
+});
+
+// The owner chat is allowlisted but the channel has no defaultAgentId set. An
+// inbound reply must still auto-provision the sole codewith agent rather than
+// bounce back the "no session" help text.
+const OWNER_CHAT = "1225577096";
+const ownerConfig: BridgeConfig = {
+  version: 1,
+  channels: {
+    tg: { id: "tg", kind: "telegram", enabled: true, botTokenEnv: "TG_TOKEN", allowedChatIds: [OWNER_CHAT] },
+  },
+  profiles: { cw: { id: "cw", agentKind: "codewith", authProfile: "account088" } },
+  agents: { cw: { id: "cw", kind: "codewith", profileId: "cw" } },
+  routes: [],
+};
+
+test("resolveAutoAgentId falls back to the sole codewith agent when no defaultAgentId", () => {
+  expect(resolveAutoAgentId(ownerConfig, ownerConfig.channels.tg)).toBe("cw");
+  // Explicit defaultAgentId always wins.
+  const withDefault = { ...ownerConfig.channels.tg, defaultAgentId: "other" };
+  expect(resolveAutoAgentId(ownerConfig, withDefault)).toBe("other");
+  // Ambiguous config (two codewith agents, none defaulted) refuses to guess.
+  const ambiguous: BridgeConfig = {
+    ...ownerConfig,
+    agents: { a: { id: "a", kind: "codewith" }, b: { id: "b", kind: "codewith" } },
+  };
+  expect(resolveAutoAgentId(ambiguous, ambiguous.channels.tg)).toBeUndefined();
+});
+
+test("owner chat with no defaultAgentId still auto-provisions an agent (not the no-session help text)", async () => {
+  process.env["TG_TOKEN"] = "test-token";
+  const bridgeState = state();
+  let ran = false;
+  let sent = "";
+  const result = await dispatchMessageWithSessions(ownerConfig, bridgeState, {
+    id: "telegram:1", channelId: "tg", chatId: OWNER_CHAT, text: "hello", receivedAt: new Date(0).toISOString(),
+  }, {
+    run: async (_c, agentId): Promise<AgentRunResult> => {
+      ran = true;
+      return { agentId, command: ["fake"], exitCode: 0, stdout: "hi back", stderr: "", timedOut: false };
+    },
+    sendTelegram: async (_t, _c, text) => { sent = text; return { ok: true }; },
+  });
+  expect(ran).toBe(true);
+  expect(sent).toBe("hi back");
+  expect(result.session?.status).toBe("delivered");
+  expect(sent).not.toContain("No bridge session");
+  const binding = bridgeState.bindings[`tg::telegram:tg:${OWNER_CHAT}`];
+  expect(binding?.activeSessionId).toMatch(/^ses_/);
 });
 
 test("malformed / non-text Telegram updates are dropped without throwing", () => {

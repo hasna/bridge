@@ -160,16 +160,37 @@ export function findBridgeBinding(config: BridgeConfig, state: BridgeState, mess
 }
 
 /**
+ * Resolves the agent an inbound conversation should auto-attach to when it has no
+ * binding yet. Preference order:
+ *   1. the channel's explicit `defaultAgentId`;
+ *   2. the sole configured `codewith` agent (the station's coding agent).
+ *
+ * (2) is what makes an inbound reply from an already-allowlisted chat (e.g. the
+ * owner chat) route to an agent instead of the "no session" help text even when
+ * the operator never set `defaultAgentId` on the channel. Resolution is
+ * config-driven — it never invents an agent id — so an ambiguous config (several
+ * codewith agents, none defaulted) still returns `undefined` rather than guessing.
+ * It deliberately does not fall back to non-codewith agents (e.g. a shell agent),
+ * so auto-provisioning stays scoped to the intended coding-agent use case.
+ */
+export function resolveAutoAgentId(config: BridgeConfig, channel: ChannelConfig): string | undefined {
+  if (channel.defaultAgentId) return channel.defaultAgentId;
+  const codewith = Object.keys(config.agents).filter((id) => config.agents[id]?.kind === "codewith");
+  return codewith.length === 1 ? codewith[0] : undefined;
+}
+
+/**
  * Lazily create a session + binding for a conversation that has none yet, using
- * the channel's configured `defaultAgentId`. This is what makes inbound replies
- * work end to end without an operator running `bridge sessions create/attach`
- * first: the first message from a chat provisions a durable session, and later
- * messages resume it (same conversationId -> same binding -> same session).
+ * the agent resolved by {@link resolveAutoAgentId}. This is what makes inbound
+ * replies work end to end without an operator running `bridge sessions
+ * create/attach` first: the first message from a chat provisions a durable
+ * session, and later messages resume it (same conversationId -> same binding ->
+ * same session).
  *
  * Returns the existing binding when one is already present, a freshly created
- * binding when the channel declares a default agent, or `undefined` when there
- * is no conversation id / no default agent configured (callers fall through to
- * routes or the no-session help text, preserving legacy behaviour).
+ * binding when an auto-provision agent resolves, or `undefined` when there is no
+ * conversation id / no resolvable agent (callers fall through to routes or the
+ * no-session help text, preserving legacy behaviour).
  */
 export function ensureConversationBinding(
   config: BridgeConfig,
@@ -181,11 +202,14 @@ export function ensureConversationBinding(
   const existing = state.bindings[bindingId(message.channelId, conversationId)];
   if (existing) return existing;
   const channel = config.channels[message.channelId];
-  const agentId = channel?.defaultAgentId;
-  if (!channel || !agentId) return undefined;
-  if (!config.agents[agentId]) {
-    throw new Error(`Channel ${channel.id} defaultAgentId not found: ${agentId}`);
+  if (!channel) return undefined;
+  // An explicit-but-missing defaultAgentId is a config error: surface it loudly
+  // rather than silently falling back to an inferred agent.
+  if (channel.defaultAgentId && !config.agents[channel.defaultAgentId]) {
+    throw new Error(`Channel ${channel.id} defaultAgentId not found: ${channel.defaultAgentId}`);
   }
+  const agentId = resolveAutoAgentId(config, channel);
+  if (!agentId) return undefined;
   const session = createBridgeSession(config, state, {
     agentId,
     title: `auto:${conversationId}`,

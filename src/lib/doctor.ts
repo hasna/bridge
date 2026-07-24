@@ -97,6 +97,15 @@ export async function doctor(configPath = defaultConfigPath(), statePath = defau
     });
   }
 
+  for (const channel of Object.values(config.channels)) {
+    if (!channel.defaultAgentId) continue;
+    checks.push({
+      name: `default-agent:${channel.id}`,
+      ok: Boolean(config.agents[channel.defaultAgentId]),
+      detail: `${channel.id} -> ${channel.defaultAgentId}`,
+    });
+  }
+
   for (const route of config.routes) {
     checks.push({
       name: `route:${route.id}`,

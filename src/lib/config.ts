@@ -72,6 +72,7 @@ const agentWorkspaceSchema = z.object({
   projectId: z.string().optional(),
   path: z.string().optional(),
   channel: z.string().optional(),
+  channelProvisionedAt: z.string().optional(),
   provisionedAt: z.string().optional(),
 });
 

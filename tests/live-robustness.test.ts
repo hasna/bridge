@@ -89,6 +89,35 @@ test("durable runs execute in the agent's OWN provisioned project folder when no
   }
 });
 
+test("claude and shell compatibility agents also run from their provisioned project folder", async () => {
+  const root = await mkdtemp(join(tmpdir(), "bridge-yolo-"));
+  try {
+    const config = makeConfig();
+    config.agents["claude-agent"] = { id: "claude-agent", kind: "claude" };
+    config.agents["shell-agent"] = { id: "shell-agent", kind: "shell" };
+    const provisionExec: ProvisionExec = async (command) => ({
+      exitCode: 0,
+      stdout: command[0] === "projects" ? '{"project":{"id":"wks_x","primary_path":"/x"}}' : "{}",
+      stderr: "",
+    });
+
+    for (const agentId of ["claude-agent", "shell-agent"]) {
+      let spawnedCwd: string | undefined;
+      const spawn: AgentSpawn = async (_command, options) => {
+        spawnedCwd = options.cwd;
+        return { exitCode: 0, stdout: "ok", stderr: "", timedOut: false };
+      };
+      await runAgent(config, agentId, {
+        message: { id: "m", channelId: "tg", chatId: "1", text: "do it", receivedAt: new Date(0).toISOString() },
+        route: { id: "r", fromChannel: "tg", toAgent: agentId },
+      }, { spawn, provision: { exec: provisionExec, root } });
+      expect(spawnedCwd).toBe(join(root, `agent-${agentId}`));
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("shell_snapshot validation warnings on stderr do not break a successful run", async () => {
   const config = makeConfig();
   const state = makeState();
@@ -112,6 +141,20 @@ test("shell_snapshot validation warnings on stderr do not break a successful run
 test("filterAgentLogNoise strips tool log lines but keeps real errors", () => {
   const noisy = `${SHELL_SNAPSHOT_NOISE}\nerror: something real broke\nReading additional input from stdin...`;
   expect(filterAgentLogNoise(noisy)).toBe("error: something real broke");
+});
+
+test("filterAgentLogNoise keeps genuine fatal stderr, stripping only trace/module-log noise", () => {
+  const text = [
+    SHELL_SNAPSHOT_NOISE, // timestamped tracing line with module target → noise
+    "ERROR: invalid API key", // genuine fatal CLI error → KEPT
+    "2026-07-24T14:24:27Z ERROR request failed with status 401", // timestamped but no module target → KEPT
+    "DEBUG rolling internal state", // debug → noise
+    "2026-07-24T14:24:27Z TRACE codex_core::exec: spawning", // trace → noise
+    "Reading additional input from stdin...",
+  ].join("\n");
+  expect(filterAgentLogNoise(text)).toBe(
+    "ERROR: invalid API key\n2026-07-24T14:24:27Z ERROR request failed with status 401",
+  );
 });
 
 test("extractCodewithErrorMessage unwraps nested JSON-encoded provider errors", () => {

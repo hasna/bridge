@@ -94,7 +94,14 @@ export interface AgentWorkspaceConfig {
   path?: string;
   /** conversations channel name for this agent (convention: agent-<name>). */
   channel?: string;
-  /** ISO timestamp of the last successful provisioning pass. */
+  /**
+   * ISO timestamp of when the `agent-<name>` conversations channel was
+   * confirmed (created or already existing). Tracked separately from
+   * {@link provisionedAt} so a transient conversations outage retries ONLY the
+   * channel on the next run without re-running project provisioning.
+   */
+  channelProvisionedAt?: string;
+  /** ISO timestamp of the last FULLY successful provisioning pass (project + channel). */
   provisionedAt?: string;
 }
 

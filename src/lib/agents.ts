@@ -424,11 +424,24 @@ export function extractCodewithLastMessage(jsonl: string): string | undefined {
  * `2026-07-24T14:24:27Z ERROR codex_core::shell_snapshot: Shell snapshot
  * validation failed: ...`. These are warnings about auxiliary features — they
  * must never fail a run nor be surfaced to the user as the failure reason.
+ *
+ * Deliberately narrow so GENUINE fatal stderr (e.g. `ERROR: invalid API key`)
+ * survives into user-facing failure text. Only three shapes are noise:
+ * 1. TRACE/DEBUG lines (timestamped or not) — never user-relevant;
+ * 2. timestamped tracing-crate log lines with a `module::path:` target
+ *    (the shell_snapshot warning shape), regardless of level;
+ * 3. codewith's `Reading additional input from stdin...` prompt echo.
  */
-const AGENT_LOG_NOISE_PATTERN =
-  /^\s*(?:\d{4}-\d{2}-\d{2}[T ][0-9:.]+Z?\s+)?(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR)\b.*$|^\s*Reading additional input from stdin\.{3}\s*$/;
+const AGENT_LOG_NOISE_PATTERN = new RegExp(
+  [
+    String.raw`^\s*(?:\d{4}-\d{2}-\d{2}[T ][0-9:.]+Z?\s+)?(?:TRACE|DEBUG)\b.*$`,
+    String.raw`^\s*\d{4}-\d{2}-\d{2}[T ][0-9:.]+Z?\s+(?:INFO|WARN|WARNING|ERROR)\s+[\w.\[\]-]+(?:::[\w.\[\]-]+)+:.*$`,
+    String.raw`^\s*Reading additional input from stdin\.{3}\s*$`,
+  ].join("|"),
+);
 
-/** Strips non-fatal tool log lines (shell_snapshot warnings etc.) from output. */
+/** Strips non-fatal tool log lines (shell_snapshot warnings etc.) from output,
+ * while KEEPING genuine fatal stderr such as `ERROR: invalid API key`. */
 export function filterAgentLogNoise(text: string): string {
   return text
     .split(/\r?\n/)
@@ -910,10 +923,10 @@ export async function runAgent(
   }
 
   const built = buildAgentCommand(config, agentId, input);
-  // Compatibility codewith runs also execute from the agent's own project
-  // folder when no explicit cwd is configured (durable runs resolve it inside
-  // runCodewithOnce).
-  if (!built.cwd && agent.kind === "codewith") {
+  // Every compatibility agent (codewith, claude, aicopilot, shell, custom
+  // command) executes from the agent's own provisioned project folder when no
+  // explicit cwd is configured (durable runs resolve it inside runCodewithOnce).
+  if (!built.cwd) {
     built.cwd = await resolveAgentCwd(config, agent, profile, input.session, deps);
   }
   const spawn = deps.spawn || defaultAgentSpawn;

@@ -53,7 +53,31 @@ All notable changes to `@hasna/bridge` are documented here.
 - **Non-fatal tool diagnostics never break or pollute a run.** shell_snapshot
   validation warnings (and similar timestamped tool log lines) on stderr do not
   fail a successful run and are stripped from user-facing failure text
-  (`filterAgentLogNoise`); only a timeout or non-zero exit fails a run.
+  (`filterAgentLogNoise`); only a timeout or non-zero exit fails a run. The
+  filter is deliberately narrow: only TRACE/DEBUG lines, timestamped
+  tracing-crate lines with a `module::path:` target, and codewith's stdin echo
+  are stripped — genuine fatal stderr (e.g. `ERROR: invalid API key`) is KEPT
+  in user-facing failure text.
+- **Channel provisioning is tracked separately and retried.** A failed
+  `agent-<name>` channel create no longer lets the pass be marked provisioned
+  (previously `provisionedAt` was gated only on the project half, so a
+  transient conversations outage skipped the channel forever). The channel half
+  is confirmed on its own `channelProvisionedAt` and a full pass requires both
+  halves; conversely a projects outage no longer re-creates an already
+  confirmed channel. Already-exists detection is narrow (genuine
+  `already exists`/`duplicate`/`conflict`/HTTP 409 shapes only) so unrelated
+  failures like "no such tenant exists" are not silently swallowed.
+- **The agent project gets a REAL primary path.** `projects create` is invoked
+  with `--yes` (approving path/dir effects) and, whenever the registry record
+  still reports `primary_path=null` (api-mode create registers without path/dir
+  effects), the path is pinned deterministically with
+  `projects update <id> --path <folder> --json`. A prompt-agent create that
+  stops at a plan falls back to the deterministic create (after re-reading by
+  name so nothing is duplicated). Project-record parsing understands the
+  prompt-agent run wrapper (`projects: [...]`, `tool_calls[].output.project`).
+- **Every agent kind runs from its provisioned folder.** The per-agent
+  workspace cwd now applies to claude/aicopilot/shell/custom-command
+  compatibility agents too, not only codewith.
 
 ### Changed (breaking, pre-1.0)
 - `AgentSessionRef` drops the per-profile `providerSessions` map; the conversation

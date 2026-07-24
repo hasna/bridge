@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   buildAccountsCommand,
   buildAgentEnv,
@@ -6,9 +9,11 @@ import {
   dispatchMessageWithSessions,
   extractCodewithLastMessage,
   extractCodewithSessionId,
+  loadState,
   recordDurableSession,
   resolveDurableTarget,
   runAgent,
+  saveState,
   type AgentRunResult,
   type AgentSpawn,
   type BridgeConfig,
@@ -196,6 +201,47 @@ test("recordDurableSession persists the captured id per profile", () => {
   expect(session.agentSession?.refId).toBe(SESSION_UUID);
   // idempotent second call reports no change
   expect(recordDurableSession(session, agent)).toBe(false);
+});
+
+test("a stored per-conversation thread_id survives a state save/load restart and resumes", async () => {
+  process.env["TG_TOKEN"] = "test-token";
+  const dir = await mkdtemp(join(tmpdir(), "bridge-state-"));
+  const statePath = join(dir, "state.json");
+  try {
+    const first = state();
+    // Turn 1: capture and persist the codewith thread id for this conversation.
+    await dispatchMessageWithSessions(config, first, {
+      id: "telegram:1", channelId: "tg", chatId: "1", text: "hi", receivedAt: new Date(0).toISOString(),
+    }, {
+      run: async (_c, agentId): Promise<AgentRunResult> => ({
+        agentId, command: ["accounts"], exitCode: 0, stdout: "{}", stderr: "", timedOut: false,
+        stdoutStructured: true, replyText: "one", providerSessionId: SESSION_UUID, authProfile: "account088",
+      }),
+      sendTelegram: async () => ({ ok: true }),
+    });
+    await saveState(first, statePath);
+
+    // Restart: a brand-new state loaded from disk must still resume the same id.
+    const reloaded = await loadState(statePath);
+    const binding = reloaded.bindings["tg::telegram:tg:1"];
+    expect(binding).toBeDefined();
+    expect(reloaded.sessions[binding!.activeSessionId].agentSession?.providerSessions?.account088).toBe(SESSION_UUID);
+
+    let seen: string[] = [];
+    await dispatchMessageWithSessions(config, reloaded, {
+      id: "telegram:2", channelId: "tg", chatId: "1", text: "again", receivedAt: new Date(0).toISOString(),
+    }, {
+      run: (c, agentId, input) => runAgent(c, agentId, input, {
+        spawn: async (command) => { seen = command; return { exitCode: 0, stdout: "{}", stderr: "", timedOut: false }; },
+        readOutput: async () => "two",
+      }),
+      sendTelegram: async () => ({ ok: true }),
+    });
+    expect(seen).toContain("resume");
+    expect(seen).toContain(SESSION_UUID);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("durable reply isolation flows through dispatch to Telegram", async () => {

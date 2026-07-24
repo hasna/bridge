@@ -20,6 +20,9 @@ All notable changes to `@hasna/bridge` are documented here.
 - New `handleInboundMessage` / `reconcileInFlight` helpers centralize the
   offset-advance decision and are unit-tested for replay-without-duplication and
   poison-message handling.
+- Regression coverage that a per-conversation codewith `thread_id` survives a
+  state `saveState`/`loadState` restart and is resumed with `codewith exec resume
+  <thread_id>` on the next message.
 
 ## 0.4.0
 

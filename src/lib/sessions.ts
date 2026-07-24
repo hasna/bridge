@@ -10,7 +10,7 @@ import type {
   SessionMessageResult,
 } from "../types.js";
 import type { BridgeState } from "./state.js";
-import { closeAgentSession, createAgentSessionRef, resolveAgent, runAgent, sendAgentSessionMessage } from "./agents.js";
+import { closeAgentSession, createAgentSessionRef, recordDurableSession, resolveAgent, runAgent, sendAgentSessionMessage } from "./agents.js";
 import { imessageHandleAllowed, sendIMessage } from "./imessage.js";
 import { routeMessage } from "./router.js";
 import { sendTelegramMessage, telegramChatAllowed, telegramToken } from "./telegram.js";
@@ -49,6 +49,16 @@ export interface DispatchMessageResult {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/**
+ * The user-facing reply text. Durable codewith runs emit JSONL on stdout, which
+ * must never be relayed to the user; the isolated reply comes from replyText.
+ */
+function agentReplyText(agent: AgentRunResult): string {
+  if (agent.replyText !== undefined) return agent.replyText.trim();
+  if (agent.stdoutStructured) return "";
+  return agent.stdout.trim();
 }
 
 function newSessionId(): string {
@@ -316,6 +326,9 @@ export async function sendBridgeSessionMessage(
   session.lastMessageAt = timestamp;
   session.updatedAt = timestamp;
   if (session.agentSession) session.agentSession.updatedAt = timestamp;
+  // Persist any durable provider session id even on failure, so the next
+  // message resumes the same codewith session rather than starting over.
+  recordDurableSession(session, agent);
 
   if (agent.timedOut || (agent.exitCode !== null && agent.exitCode !== 0)) {
     return {
@@ -324,11 +337,11 @@ export async function sendBridgeSessionMessage(
       agent,
       deliveredResponse: false,
       status: "failed",
-      message: agent.stderr.trim() || agent.stdout.trim() || (agent.timedOut ? "Agent timed out" : `Agent exited ${agent.exitCode}`),
+      message: agent.stderr.trim() || agentReplyText(agent) || (agent.timedOut ? "Agent timed out" : `Agent exited ${agent.exitCode}`),
     };
   }
 
-  const responseText = agent.stdout.trim();
+  const responseText = agentReplyText(agent);
   await options.beforeDeliver?.(agent, responseText);
   const deliveredResponse = responseText ? await deliverResponse(config, message, responseText, options) : false;
   return {

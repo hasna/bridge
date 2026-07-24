@@ -124,7 +124,17 @@ export type AgentSessionMode = "durable" | "compatibility";
 export interface AgentSessionRef {
   kind: AgentKind;
   mode: AgentSessionMode;
+  /** Provider session id for the currently active auth profile (durable mode). */
   refId?: string;
+  /** Accounts/codewith auth profile the active provider session belongs to. */
+  authProfile?: string;
+  /**
+   * Durable provider session ids keyed by auth profile. codewith durable
+   * sessions live under a single profile's CODEWITH_HOME and are only resumable
+   * under that same profile, so each profile keeps its own session id. Rotating
+   * to another profile (on exhaustion) starts a fresh session there.
+   */
+  providerSessions?: Record<string, string>;
   createdAt?: string;
   updatedAt?: string;
   detail?: string;
@@ -191,6 +201,18 @@ export interface AgentRunResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /**
+   * Isolated reply text for the user. For durable codewith runs stdout is JSONL
+   * event output and must NOT be shown to the user; the reply comes from the
+   * agent's last-message file (or the parsed final assistant event) instead.
+   */
+  replyText?: string;
+  /** True when stdout is structured (JSONL) and unsafe to relay as a reply. */
+  stdoutStructured?: boolean;
+  /** Provider (codewith) session id created/resumed by this run, if any. */
+  providerSessionId?: string;
+  /** Auth profile this run executed under. */
+  authProfile?: string;
 }
 
 export interface RoutedMessageResult {

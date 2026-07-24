@@ -39,13 +39,57 @@ export interface RunAgentDeps {
 }
 
 /**
- * Env keys that must never be inherited by a code-executing agent whose input is
- * attacker-influenced (inbound chat text). Matches obviously-credential-shaped
- * names; operators can re-add a specific key a tool genuinely needs via
- * profile.env / agent.env (explicit values always win).
+ * Explicit allow-list of the environment a code-executing agent (whose input is
+ * attacker-influenced inbound chat text) may inherit from the station process.
+ * Everything not on this list — or a configured passthrough — is dropped, so
+ * station secrets that do NOT happen to match a credential-shaped name pattern
+ * (e.g. `DATABASE_URL`, `AWS_ACCESS_KEY_ID`, `TELEGRAM_SESSION`) never leak. A
+ * tool that genuinely needs another var gets it via profile/agent `env` (explicit
+ * values) or `envPassthrough` (names / `PREFIX*` globs), never by default.
+ */
+const DEFAULT_ENV_ALLOWLIST = new Set<string>([
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD",
+  "TERM", "COLORTERM", "LANG", "LANGUAGE", "TZ", "HOSTNAME",
+  "TMPDIR", "TMP", "TEMP",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE",
+]);
+
+/** Allow-listed prefixes: locale, XDG base dirs, and the toolchains that resolve
+ * the `accounts` / `codewith` / `bun` binaries and their per-profile homes. */
+const DEFAULT_ENV_ALLOW_PREFIXES = [
+  "LC_", "XDG_", "CODEWITH_", "ACCOUNTS_", "BUN_",
+  "NVM_", "FNM_", "VOLTA_", "ASDF_", "MISE_",
+];
+
+/**
+ * Secondary guard applied to allow-listed / passed-through keys only, so an overly
+ * broad passthrough glob (e.g. `AWS_*`) still cannot smuggle a credential-shaped
+ * var through. Explicit profile/agent `env` values are exempt (operator intent).
  */
 const SENSITIVE_ENV_PATTERN =
   /(^|_)(TOKEN|SECRET|SECRETS|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|API_?KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|SESSION_KEY|AUTH_TOKEN|BEARER)$/i;
+
+interface EnvPassthroughSpec {
+  exact: Set<string>;
+  prefixes: string[];
+}
+
+/** Parses profile/agent `envPassthrough` entries into exact names and `PREFIX*` globs. */
+export function envPassthroughSpec(profile?: ProfileConfig, agent?: AgentConfig): EnvPassthroughSpec {
+  const exact = new Set<string>();
+  const prefixes: string[] = [];
+  for (const raw of [...(profile?.envPassthrough || []), ...(agent?.envPassthrough || [])]) {
+    if (raw.endsWith("*")) prefixes.push(raw.slice(0, -1));
+    else exact.add(raw);
+  }
+  return { exact, prefixes };
+}
+
+function envKeyAllowed(key: string, spec: EnvPassthroughSpec): boolean {
+  if (DEFAULT_ENV_ALLOWLIST.has(key) || spec.exact.has(key)) return true;
+  return DEFAULT_ENV_ALLOW_PREFIXES.some((p) => key.startsWith(p))
+    || spec.prefixes.some((p) => key.startsWith(p));
+}
 
 function renderCustomArgs(args: string[] | undefined, prompt: string): string[] {
   if (!args?.length) return [];
@@ -83,10 +127,13 @@ export function bridgeSecretEnvNames(config: BridgeConfig): Set<string> {
 }
 
 /**
- * Builds the environment handed to a spawned agent. Starts from the process env
- * minus the bridge's own channel secrets and any credential-shaped keys, then
- * layers profile/agent env (which can intentionally re-introduce a specific key
- * a tool needs). `profile.home` maps to HOME.
+ * Builds the environment handed to a spawned agent using an explicit allow-list:
+ * only {@link DEFAULT_ENV_ALLOWLIST} / {@link DEFAULT_ENV_ALLOW_PREFIXES} vars and
+ * configured `envPassthrough` names survive from the station process. The bridge's
+ * own channel secrets and any credential-shaped key are additionally stripped even
+ * if allow-listed. Profile/agent `env` is then layered on top and always wins
+ * (this is how a tool re-introduces a specific key it needs). `profile.home` maps
+ * to HOME. The full station environment is never inherited.
  */
 export function buildAgentEnv(
   config: BridgeConfig,
@@ -96,11 +143,13 @@ export function buildAgentEnv(
 ): Record<string, string> {
   const overrides = mergeEnv(profile, agent) || {};
   const denied = bridgeSecretEnvNames(config);
+  const spec = envPassthroughSpec(profile, agent);
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(baseEnv)) {
     if (value === undefined) continue;
-    if (denied.has(key)) continue;
-    if (SENSITIVE_ENV_PATTERN.test(key)) continue;
+    if (!envKeyAllowed(key, spec)) continue;      // allow-list: drop everything else
+    if (denied.has(key)) continue;                // never inherit the bridge's own secrets
+    if (SENSITIVE_ENV_PATTERN.test(key)) continue; // secondary guard on allow-listed keys
     env[key] = value;
   }
   return { ...env, ...overrides };

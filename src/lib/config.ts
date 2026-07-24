@@ -65,6 +65,7 @@ const profileSchema = z.object({
   command: z.string().optional(),
   args: z.array(z.string()).optional(),
   env: envSchema.optional(),
+  envPassthrough: z.array(z.string()).optional(),
 });
 
 const agentSchema = z.object({
@@ -76,6 +77,7 @@ const agentSchema = z.object({
   args: z.array(z.string()).optional(),
   cwd: z.string().optional(),
   env: envSchema.optional(),
+  envPassthrough: z.array(z.string()).optional(),
   timeoutMs: z.number().int().positive().optional(),
 });
 

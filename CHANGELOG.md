@@ -20,9 +20,14 @@ All notable changes to `@hasna/bridge` are documented here.
 
 ### Security
 - `buildAgentEnv` no longer inherits the full station environment into the
-  code-executing agent. The bridge's own channel secrets (Telegram bot tokens,
-  webhook secrets) and credential-shaped env keys are stripped before spawning;
-  operators can re-add a specific key a tool needs via profile/agent `env`.
+  code-executing agent. It now uses an explicit **allow-list** (PATH/HOME/locale,
+  XDG base dirs, and the `codewith`/`accounts`/`bun` toolchain prefixes) instead
+  of a deny-list, so station secrets that do not match a credential-shaped name —
+  `DATABASE_URL`, `AWS_ACCESS_KEY_ID`, `TELEGRAM_SESSION`, etc. — are dropped by
+  default rather than leaking. The bridge's own channel secrets and any
+  credential-shaped key are additionally stripped even if allow-listed. A tool
+  that needs another var gets it via profile/agent `env` (explicit values win) or
+  the new `envPassthrough` config (exact names / `PREFIX*` globs).
 
 ## 0.3.0
 

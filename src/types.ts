@@ -70,6 +70,12 @@ export interface ProfileConfig {
   command?: string;
   args?: string[];
   env?: Record<string, string>;
+  /**
+   * Additional station env var names to pass through to the spawned agent on top
+   * of the built-in allow-list. Entries may be exact names (`FOO`) or `PREFIX*`
+   * globs (`GIT_*`). Credential-shaped names are still stripped defensively.
+   */
+  envPassthrough?: string[];
 }
 
 export interface AgentConfig {
@@ -81,6 +87,8 @@ export interface AgentConfig {
   args?: string[];
   cwd?: string;
   env?: Record<string, string>;
+  /** Extra station env var names to pass through (see {@link ProfileConfig.envPassthrough}). */
+  envPassthrough?: string[];
   timeoutMs?: number;
 }
 

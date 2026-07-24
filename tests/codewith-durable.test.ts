@@ -72,20 +72,54 @@ test("extractCodewithLastMessage returns the last assistant text and ignores err
   expect(extractCodewithLastMessage(jsonl)).toBe("final answer");
 });
 
-test("buildAgentEnv strips bridge channel secrets and credential-shaped keys", () => {
+test("buildAgentEnv passes only the allow-list and drops everything else (incl. non-credential-shaped secrets)", () => {
   const env = buildAgentEnv(config, config.profiles.cw, config.agents.cw, {
     PATH: "/usr/bin",
     HOME: "/home/x",
+    LC_ALL: "C",
+    CODEWITH_HOME: "/home/x/.codewith",
     TG_TOKEN: "SECRET-BOT-TOKEN",
     ANTHROPIC_API_KEY: "sk-should-be-stripped",
     SOME_PASSWORD: "nope",
-    HARMLESS: "ok",
+    // Station secrets that do NOT match a credential-shaped name — a deny-list
+    // would leak these; the allow-list drops them because they are not listed.
+    DATABASE_URL: "postgres://user:pw@host/db",
+    AWS_ACCESS_KEY_ID: "AKIAEXAMPLE",
+    TELEGRAM_SESSION: "1a2b3c",
+    RANDOM_APP_STATE: "leak-me",
   });
+  // Allow-listed vars survive.
   expect(env.PATH).toBe("/usr/bin");
-  expect(env.HARMLESS).toBe("ok");
+  expect(env.HOME).toBe("/home/x");
+  expect(env.LC_ALL).toBe("C");
+  expect(env.CODEWITH_HOME).toBe("/home/x/.codewith");
+  // Bridge secret + credential-shaped keys stripped.
   expect(env.TG_TOKEN).toBeUndefined();
   expect(env.ANTHROPIC_API_KEY).toBeUndefined();
   expect(env.SOME_PASSWORD).toBeUndefined();
+  // Not-on-the-allow-list station vars (including secrets that dodge name patterns).
+  expect(env.DATABASE_URL).toBeUndefined();
+  expect(env.AWS_ACCESS_KEY_ID).toBeUndefined();
+  expect(env.TELEGRAM_SESSION).toBeUndefined();
+  expect(env.RANDOM_APP_STATE).toBeUndefined();
+});
+
+test("buildAgentEnv honours envPassthrough names and PREFIX* globs but still strips credential-shaped ones", () => {
+  const cfg: BridgeConfig = {
+    ...config,
+    agents: { cw: { ...config.agents.cw, envPassthrough: ["MY_FLAG", "GIT_*"] } },
+  };
+  const env = buildAgentEnv(cfg, config.profiles.cw, cfg.agents.cw, {
+    MY_FLAG: "1",
+    GIT_AUTHOR_NAME: "bot",
+    GIT_ACCESS_KEY: "should-still-be-stripped",
+    OTHER: "no",
+  });
+  expect(env.MY_FLAG).toBe("1");
+  expect(env.GIT_AUTHOR_NAME).toBe("bot");
+  // Even an explicitly passed-through prefix cannot smuggle a credential-shaped key.
+  expect(env.GIT_ACCESS_KEY).toBeUndefined();
+  expect(env.OTHER).toBeUndefined();
 });
 
 test("buildAgentEnv lets an explicit profile/agent env re-add a needed key", () => {

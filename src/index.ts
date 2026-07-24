@@ -7,6 +7,7 @@ export * from "./lib/doctor.js";
 export * from "./lib/imessage.js";
 export * from "./lib/paths.js";
 export * from "./lib/router.js";
+export * from "./lib/serve.js";
 export * from "./lib/sessions.js";
 export * from "./lib/state.js";
 export * from "./lib/telegram.js";

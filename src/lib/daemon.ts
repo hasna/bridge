@@ -41,6 +41,8 @@ export interface DaemonMetadata {
   statePath: string;
   intervalMs: number;
   serveJson: boolean;
+  resume?: boolean;
+  maxAttempts?: number;
   daemonDir: string;
   bridgeHome: string;
   stdoutLog: string;
@@ -77,6 +79,10 @@ export interface DaemonStartOptions {
   statePath?: string;
   intervalMs?: number;
   serveJson?: boolean;
+  /** Pass `--resume` to serve so durable in-flight state is reconciled on start. Defaults to true. */
+  resume?: boolean;
+  /** Pass `--max-attempts` to serve. */
+  maxAttempts?: number;
 }
 
 export interface DaemonStopOptions {
@@ -93,6 +99,8 @@ export interface DaemonInstallOptions {
   statePath?: string;
   intervalMs?: number;
   serveJson?: boolean;
+  resume?: boolean;
+  maxAttempts?: number;
 }
 
 export interface DaemonInstallResult {
@@ -259,7 +267,7 @@ function safeTelegramApiBaseInfo(): DaemonStatus["telegramApiBase"] {
   }
 }
 
-function startCommand(options: Required<Pick<DaemonStartOptions, "configPath" | "statePath" | "intervalMs" | "serveJson">>): string[] {
+function startCommand(options: Required<Pick<DaemonStartOptions, "configPath" | "statePath" | "intervalMs" | "serveJson">> & Pick<DaemonStartOptions, "resume" | "maxAttempts">): string[] {
   const scriptPath = process.argv[1];
   const base = scriptPath ? [process.execPath, scriptPath] : ["bridge"];
   const command = [
@@ -273,6 +281,8 @@ function startCommand(options: Required<Pick<DaemonStartOptions, "configPath" | 
     String(options.intervalMs),
   ];
   if (options.serveJson) command.push("--json");
+  if (options.resume !== false) command.push("--resume");
+  if (options.maxAttempts !== undefined) command.push("--max-attempts", String(options.maxAttempts));
   return command;
 }
 
@@ -385,13 +395,15 @@ export async function startProcessDaemon(options: DaemonStartOptions = {}): Prom
     const statePath = resolve(options.statePath || defaultStatePath());
     const intervalMs = options.intervalMs ?? 1000;
     const serveJson = Boolean(options.serveJson);
+    const resume = options.resume !== false;
+    const maxAttempts = options.maxAttempts;
     if (!Number.isInteger(intervalMs) || intervalMs < 0) throw new Error("--interval must be a non-negative integer");
     await validateStartConfig(configPath);
 
     const stdoutFd = openPrivateLog(paths.stdoutLog);
     const stderrFd = openPrivateLog(paths.stderrLog);
     try {
-      const command = startCommand({ configPath, statePath, intervalMs, serveJson });
+      const command = startCommand({ configPath, statePath, intervalMs, serveJson, resume, maxAttempts });
       const child = spawn(command[0]!, command.slice(1), {
         cwd: process.cwd(),
         detached: true,
@@ -420,6 +432,8 @@ export async function startProcessDaemon(options: DaemonStartOptions = {}): Prom
         statePath,
         intervalMs,
         serveJson,
+        resume,
+        maxAttempts,
         daemonDir: paths.dir,
         bridgeHome: bridgeHome(),
         stdoutLog: paths.stdoutLog,
@@ -489,6 +503,8 @@ export async function restartProcessDaemon(options: DaemonStartOptions & DaemonS
     statePath: options.statePath || metadata?.statePath,
     intervalMs: options.intervalMs ?? metadata?.intervalMs,
     serveJson: options.serveJson ?? metadata?.serveJson,
+    resume: options.resume ?? metadata?.resume,
+    maxAttempts: options.maxAttempts ?? metadata?.maxAttempts,
   });
 }
 
@@ -576,7 +592,7 @@ export async function installDaemon(options: DaemonInstallOptions = {}): Promise
   const statePath = resolve(options.statePath || defaultStatePath());
   const intervalMs = options.intervalMs ?? 1000;
   const serveJson = Boolean(options.serveJson);
-  const command = startCommand({ configPath, statePath, intervalMs, serveJson });
+  const command = startCommand({ configPath, statePath, intervalMs, serveJson, resume: options.resume, maxAttempts: options.maxAttempts });
   const config = await loadConfig(configPath);
   const requiredEnv = requiredTelegramEnvVars(config);
 

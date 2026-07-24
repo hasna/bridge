@@ -251,16 +251,24 @@ export function buildAccountsCommand(authProfile: string | undefined, codewithAr
 const SESSION_ID_KEYS = new Set([
   "session_id", "sessionid", "conversation_id", "conversationid", "thread_id", "threadid",
 ]);
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Nested containers whose `id` is a session id, e.g. {"session":{"id":"..."}}.
+const SESSION_CONTAINER_KEYS = new Set(["session", "thread", "conversation"]);
 
 function searchSessionId(value: unknown, depth = 0): string | undefined {
   if (depth > 6 || value === null || typeof value !== "object") return undefined;
-  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+  const obj = value as Record<string, unknown>;
+  for (const [key, raw] of Object.entries(obj)) {
     const norm = key.toLowerCase().replaceAll("-", "_");
+    // Explicit session-id keys are the strongest, least ambiguous signal.
     if (SESSION_ID_KEYS.has(norm) && typeof raw === "string" && raw) return raw;
-    if (norm === "id" && typeof raw === "string" && UUID_RE.test(raw)) return raw;
+    // A session/thread/conversation container object carrying an id/session_id.
+    if (SESSION_CONTAINER_KEYS.has(norm) && raw && typeof raw === "object") {
+      const nested = raw as Record<string, unknown>;
+      const id = nested["id"] ?? nested["session_id"] ?? nested["sessionId"];
+      if (typeof id === "string" && id) return id;
+    }
   }
-  for (const raw of Object.values(value as Record<string, unknown>)) {
+  for (const raw of Object.values(obj)) {
     const found = searchSessionId(raw, depth + 1);
     if (found) return found;
   }

@@ -159,6 +159,51 @@ export function findBridgeBinding(config: BridgeConfig, state: BridgeState, mess
   return state.bindings[bindingId(message.channelId, conversationId)];
 }
 
+/**
+ * Lazily create a session + binding for a conversation that has none yet, using
+ * the channel's configured `defaultAgentId`. This is what makes inbound replies
+ * work end to end without an operator running `bridge sessions create/attach`
+ * first: the first message from a chat provisions a durable session, and later
+ * messages resume it (same conversationId -> same binding -> same session).
+ *
+ * Returns the existing binding when one is already present, a freshly created
+ * binding when the channel declares a default agent, or `undefined` when there
+ * is no conversation id / no default agent configured (callers fall through to
+ * routes or the no-session help text, preserving legacy behaviour).
+ */
+export function ensureConversationBinding(
+  config: BridgeConfig,
+  state: BridgeState,
+  message: BridgeMessage,
+): BridgeBinding | undefined {
+  const conversationId = messageConversationId(config, message);
+  if (!conversationId) return undefined;
+  const existing = state.bindings[bindingId(message.channelId, conversationId)];
+  if (existing) return existing;
+  const channel = config.channels[message.channelId];
+  const agentId = channel?.defaultAgentId;
+  if (!channel || !agentId) return undefined;
+  if (!config.agents[agentId]) {
+    throw new Error(`Channel ${channel.id} defaultAgentId not found: ${agentId}`);
+  }
+  const session = createBridgeSession(config, state, {
+    agentId,
+    title: `auto:${conversationId}`,
+  });
+  const authorization = channel.kind === "telegram"
+    ? (message.chatId ? { chatId: message.chatId } : undefined)
+    : channel.kind === "imessage"
+      ? (message.from || message.chatId ? { from: message.from, chatId: message.chatId } : undefined)
+      : undefined;
+  return attachBridgeSession(config, state, {
+    sessionId: session.id,
+    channelId: message.channelId,
+    conversation: conversationId,
+    makeDefault: true,
+    authorization,
+  });
+}
+
 function noSessionText(channelId: string, conversationId?: string): string {
   return [
     "No bridge session is attached to this conversation.",
@@ -358,7 +403,14 @@ export async function dispatchMessageWithSessions(
   await options.persistState?.(state);
 
   try {
-    const binding = conversationId ? state.bindings[bindingId(message.channelId, conversationId)] : undefined;
+    let binding = conversationId ? state.bindings[bindingId(message.channelId, conversationId)] : undefined;
+    if (!binding && channelAuthorized(config, message)) {
+      const created = ensureConversationBinding(config, state, message);
+      if (created) {
+        binding = created;
+        await options.persistState?.(state);
+      }
+    }
     if (binding) {
       if (!bindingAuthorized(binding, message)) {
         const session: SessionMessageResult = {

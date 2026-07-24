@@ -11,6 +11,13 @@ export interface BaseChannelConfig {
   kind: ChannelKind;
   label?: string;
   enabled?: boolean;
+  /**
+   * Agent that inbound messages auto-attach to when no session binding and no
+   * matching route already exist for the conversation. Enables replies to work
+   * without a manual `bridge sessions create/attach`: the first inbound message
+   * lazily creates a durable session + binding, and later messages resume it.
+   */
+  defaultAgentId?: string;
 }
 
 export interface TelegramChannelConfig extends BaseChannelConfig {

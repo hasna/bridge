@@ -262,6 +262,7 @@ channels
   .option("--default-chat-id <id>", "default chat id for bridge send")
   .option("--allowed-chat-ids <ids>", "comma-separated allowed chat ids")
   .option("--allow-all-chats", "explicitly allow every chat that can reach this bot")
+  .option("--default-agent <id>", "agent that inbound messages auto-attach to when no session/route exists")
   .option("--broadcast-chat-ids <ids>", "comma-separated outbound broadcast chat ids (channels/groups)")
   .option("--allow-all-broadcasts", "explicitly allow broadcasting to any chat id")
   .option("-c, --config <path>", "config path", defaultConfigPath())
@@ -275,6 +276,7 @@ channels
       id,
       kind: "telegram",
       enabled: true,
+      defaultAgentId: options.defaultAgent,
       botTokenEnv: options.tokenEnv,
       defaultChatId: options.defaultChatId,
       allowedChatIds,
@@ -288,10 +290,11 @@ channels
   .command("add-console")
   .argument("<id>")
   .description("Add a console channel for local testing")
+  .option("--default-agent <id>", "agent that inbound messages auto-attach to when no session/route exists")
   .option("-c, --config <path>", "config path", defaultConfigPath())
   .option("--json", "output JSON")
   .action(async (id, options) => {
-    const config = await upsertChannel({ id, kind: "console", enabled: true }, options.config);
+    const config = await upsertChannel({ id, kind: "console", enabled: true, defaultAgentId: options.defaultAgent }, options.config);
     options.json ? asJson(config.channels[id]) : console.log(`Added console channel ${id}`);
   });
 channels
@@ -306,6 +309,7 @@ channels
   .option("--receive", "enable local Messages chat.db polling")
   .option("--chat-db-path <path>", "override Messages chat.db path")
   .option("--poll-limit <n>", "maximum rows per poll")
+  .option("--default-agent <id>", "agent that inbound messages auto-attach to when no session/route exists")
   .option("-c, --config <path>", "config path", defaultConfigPath())
   .option("--json", "output JSON")
   .action(async (id, options) => {
@@ -318,6 +322,7 @@ channels
       id,
       kind: "imessage",
       enabled: true,
+      defaultAgentId: options.defaultAgent,
       defaultHandle: options.defaultHandle,
       allowedHandles,
       allowAllHandles: Boolean(options.allowAllHandles),

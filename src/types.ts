@@ -232,6 +232,15 @@ export interface AgentRunResult {
   exhausted?: boolean;
   /** True when the adapter rotated to a different auth profile during this turn. */
   rotated?: boolean;
+  /**
+   * True when the turn ran on a fresh codewith session that did not carry the
+   * conversation's prior context — because rotation switched to another profile
+   * (durable sessions are not resumable across profiles) or a stale session was
+   * self-healed. Callers should tell the user their context was reset.
+   */
+  contextReset?: boolean;
+  /** True when a resumed session id was gone and the turn was retried fresh. */
+  staleSessionHealed?: boolean;
 }
 
 export interface RoutedMessageResult {

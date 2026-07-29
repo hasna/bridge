@@ -675,6 +675,80 @@ export async function startProcessDaemon(options: DaemonStartOptions = {}): Prom
   });
 }
 
+// ─── stop grace window ────────────────────────────────────────────────────────
+
+/**
+ * serve installs a SIGTERM handler that only raises a stop flag, which
+ * suppresses the default terminate-on-signal. It therefore exits at the next
+ * loop boundary, not on the signal — so a stop budget has to cover whatever
+ * serve can legitimately still be inside.
+ *
+ * The two things it can be inside are one agent turn and one Telegram long
+ * poll, both of which are configured, so the window is derived rather than
+ * guessed. This is a *ceiling*: `waitForExit` returns the moment the process is
+ * gone, so a wide ceiling costs an idle daemon nothing.
+ */
+
+/**
+ * The agent runner's default turn budget (`agent.timeoutMs ?? 120_000`, see
+ * agents.ts). Mirrored rather than imported because agents.ts does not export
+ * it; if that default changes, change this with it.
+ */
+const DEFAULT_AGENT_TIMEOUT_MS = 120_000;
+
+/** serve's default Telegram long poll (`channel.pollTimeoutSeconds || 20`). */
+const DEFAULT_POLL_TIMEOUT_SECONDS = 20;
+
+/** Headroom for serve to deliver the reply and persist state after a turn. */
+const STOP_SETTLE_MARGIN_MS = 2_000;
+
+/** Floor: a bridge with no agents and no pollers still deserves a moment. */
+const MIN_STOP_GRACE_MS = 5_000;
+
+/** Ceiling: a misconfigured budget must not let `daemon stop` hang forever. */
+const MAX_STOP_GRACE_MS = 10 * 60_000;
+
+/** `--force` asks for speed: SIGTERM, a brief moment, then SIGKILL. */
+const FORCE_STOP_GRACE_MS = 2_000;
+
+/** How long to wait for SIGKILL to take effect before giving up. */
+const KILL_GRACE_MS = 2_000;
+
+/**
+ * Longest a stop should wait for serve to exit on its own, derived from config:
+ * one in-flight agent turn plus one in-flight long poll, plus settle margin,
+ * clamped to a sane range.
+ */
+export function stopGraceMsForConfig(config: BridgeConfig): number {
+  const agents = Object.values(config.agents);
+  const agentCeiling = agents.length
+    ? Math.max(...agents.map((agent) => agent.timeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS))
+    : 0;
+
+  const pollers = telegramChannels(config);
+  const pollCeiling = pollers.length
+    ? Math.max(...pollers.map((channel) => (channel.pollTimeoutSeconds || DEFAULT_POLL_TIMEOUT_SECONDS) * 1000))
+    : 0;
+
+  const derived = agentCeiling + pollCeiling + (agentCeiling || pollCeiling ? STOP_SETTLE_MARGIN_MS : 0);
+  return Math.min(MAX_STOP_GRACE_MS, Math.max(MIN_STOP_GRACE_MS, derived));
+}
+
+async function resolveStopGraceMs(options: DaemonStopOptions, metadata: DaemonMetadata): Promise<number> {
+  if (options.timeoutMs !== undefined) return options.timeoutMs;
+  if (options.force) return FORCE_STOP_GRACE_MS;
+  try {
+    return stopGraceMsForConfig(await loadConfig(metadata.configPath));
+  } catch {
+    // Config unreadable: assume the widest realistic in-flight turn rather than
+    // cutting a busy daemon short. SIGKILL still bounds the total wait.
+    return Math.min(
+      MAX_STOP_GRACE_MS,
+      DEFAULT_AGENT_TIMEOUT_MS + DEFAULT_POLL_TIMEOUT_SECONDS * 1000 + STOP_SETTLE_MARGIN_MS,
+    );
+  }
+}
+
 async function stopPid(pid: number, force: boolean): Promise<void> {
   // Guarded so a corrupt pid can never turn into kill(0, …) — "signal my own
   // process group", i.e. the user's shell.
@@ -698,13 +772,28 @@ async function killDaemonProcessGroup(pid: number): Promise<void> {
   }
 }
 
+/**
+ * A pid that has exited but not yet been reaped still answers `kill(pid, 0)`.
+ * Only consulted once a wait has otherwise failed, since it costs a subprocess.
+ */
+async function processIsZombie(pid: number): Promise<boolean> {
+  const proc = Bun.spawn(["ps", "-p", String(pid), "-o", "stat="], { stdout: "pipe", stderr: "ignore" });
+  if ((await proc.exited) !== 0) return false;
+  return (await new Response(proc.stdout).text()).trim().startsWith("Z");
+}
+
 async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
   const started = Date.now();
+  // Back off from a tight first poll: the grace window is a ceiling, so an idle
+  // daemon must be observed gone in milliseconds, not at the next 100ms tick.
+  let delay = 5;
   while (Date.now() - started < timeoutMs) {
     if (!pidAlive(pid)) return true;
-    await Bun.sleep(100);
+    await Bun.sleep(Math.min(delay, Math.max(1, timeoutMs - (Date.now() - started))));
+    delay = Math.min(100, delay * 2);
   }
-  return !pidAlive(pid);
+  if (!pidAlive(pid)) return true;
+  return processIsZombie(pid);
 }
 
 export async function stopProcessDaemon(options: DaemonStopOptions = {}): Promise<DaemonStatus> {
@@ -718,13 +807,28 @@ export async function stopProcessDaemon(options: DaemonStopOptions = {}): Promis
       return daemonStatus({ daemonDir: paths.dir, supervisor: "process", reap: false });
     }
 
+    const graceMs = await resolveStopGraceMs(options, metadata);
     await stopPid(metadata.pid, false);
-    let exited = await waitForExit(metadata.pid, options.timeoutMs ?? 5000);
-    if (!exited && options.force) {
+    let exited = await waitForExit(metadata.pid, graceMs);
+    if (!exited) {
+      // Escalate unconditionally. `force` now selects a *shorter* grace window
+      // rather than deciding whether SIGKILL happens at all: once the derived
+      // window (a full agent turn plus a full long poll) has elapsed, the daemon
+      // is wedged rather than busy, and leaving it alive to fail the caller is
+      // not a defined outcome.
       await stopPid(metadata.pid, true);
-      exited = await waitForExit(metadata.pid, 2000);
+      exited = await waitForExit(metadata.pid, KILL_GRACE_MS);
     }
-    if (!exited) throw new Error(`Bridge daemon did not stop within ${options.timeoutMs ?? 5000}ms`);
+    if (!exited) {
+      // Deliberately keep the metadata: the process is still alive, and dropping
+      // its record would let the next `start` launch a second daemon alongside
+      // it, both polling the same channels. Once it does die, `status`/`doctor`/
+      // `start` reap the record automatically.
+      throw new Error(
+        `Bridge daemon pid ${metadata.pid} survived SIGTERM (${graceMs}ms) and SIGKILL (${KILL_GRACE_MS}ms); ` +
+        `leaving metadata at ${paths.metadataFile} so the live process stays tracked`,
+      );
+    }
     await removeMetadata(paths);
     return daemonStatus({ daemonDir: paths.dir, supervisor: "process", reap: false });
   });

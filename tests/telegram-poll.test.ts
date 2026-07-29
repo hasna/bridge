@@ -155,3 +155,111 @@ test("an abort signal cancels an in-flight long poll", async () => {
     server.stop(true);
   }
 });
+
+test("a description that echoes the request URI never retains the token", async () => {
+  // A self-hosted telegram-bot-api or a corporate proxy in front of
+  // BRIDGE_TELEGRAM_API_BASE can echo the request URI back in `description`.
+  // The token must be stripped from the stored property, not only the message:
+  // Bun's uncaught-error printer dumps an error's own properties.
+  const server = Bun.serve({
+    port: 0,
+    fetch: (request) => Response.json(
+      { ok: false, error_code: 404, description: `Cannot GET ${new URL(request.url).pathname}` },
+      { status: 404 },
+    ),
+  });
+  process.env["BRIDGE_TELEGRAM_API_BASE"] = `http://127.0.0.1:${server.port}`;
+  try {
+    const err = await getTelegramUpdates(TOKEN, { timeoutSeconds: 1 }).catch((e) => e);
+    expect(err).toBeInstanceOf(TelegramApiError);
+    expect((err as TelegramApiError).description).toBeDefined();
+    expect((err as TelegramApiError).description).not.toContain(TOKEN);
+    expect(errorSurface(err)).not.toContain(TOKEN);
+    expect(errorSurface(err)).not.toContain("SUPER-SECRET");
+  } finally {
+    server.stop(true);
+  }
+});
+
+test("a whitespace-padded token is still redacted", async () => {
+  // `export TOKEN=$(cat tokenfile)` keeps a trailing newline. WHATWG URL parsing
+  // strips \n/\r/\t, so the CLEAN token goes on the wire while an exact-substring
+  // redaction searches for the padded value and matches nothing.
+  const padded = `${TOKEN}\n`;
+  const server = Bun.serve({
+    port: 0,
+    fetch: (request) => Response.json(
+      { ok: false, error_code: 404, description: `Cannot GET ${new URL(request.url).pathname}` },
+      { status: 404 },
+    ),
+  });
+  process.env["BRIDGE_TELEGRAM_API_BASE"] = `http://127.0.0.1:${server.port}`;
+  try {
+    const err = await getTelegramUpdates(padded, { timeoutSeconds: 1 }).catch((e) => e);
+    expect(errorSurface(err)).not.toContain(TOKEN);
+    expect(errorSurface(err)).not.toContain("SUPER-SECRET");
+  } finally {
+    server.stop(true);
+  }
+
+  process.env["BRIDGE_TELEGRAM_API_BASE"] = "http://127.0.0.1:1";
+  const netErr = await getTelegramUpdates(padded, { timeoutSeconds: 1 }).catch((e) => e);
+  expect(errorSurface(netErr)).not.toContain(TOKEN);
+  expect(errorSurface(netErr)).not.toContain("SUPER-SECRET");
+});
+
+test("any bot-token-shaped path segment is redacted, not just the token we hold", async () => {
+  // Structural defence: a proxy can echo a redirect, a different bot's path, or a
+  // percent-encoded form. Value-only redaction misses all three.
+  const other = "987654:ANOTHER-BOTS-SECRET-TOKEN-X";
+  const server = Bun.serve({
+    port: 0,
+    fetch: () => Response.json(
+      {
+        ok: false,
+        error_code: 404,
+        description: `upstream /bot${other}/getUpdates and /bot${encodeURIComponent(TOKEN)}/getUpdates both failed`,
+      },
+      { status: 404 },
+    ),
+  });
+  process.env["BRIDGE_TELEGRAM_API_BASE"] = `http://127.0.0.1:${server.port}`;
+  try {
+    const err = await getTelegramUpdates(TOKEN, { timeoutSeconds: 1 }).catch((e) => e);
+    const surface = errorSurface(err);
+    expect(surface).not.toContain(other);
+    expect(surface).not.toContain("ANOTHER-BOTS-SECRET");
+    expect(surface).not.toContain(encodeURIComponent(TOKEN));
+    expect(surface).not.toContain("SUPER-SECRET");
+  } finally {
+    server.stop(true);
+  }
+});
+
+test("a bare token echoed without the /bot prefix is redacted even when padded", async () => {
+  // The structural sweep only matches `/bot<id>:<secret>` path segments. An
+  // upstream that parses the credential out and logs it bare ("unknown bot
+  // credential: <token>") escapes it, so the value pass must cover the trimmed
+  // form too — the padded env value never appears on the wire.
+  const padded = `${TOKEN}\n`;
+  const server = Bun.serve({
+    port: 0,
+    fetch(request) {
+      const segment = new URL(request.url).pathname.split("/")[1] || "";
+      return Response.json(
+        { ok: false, error_code: 401, description: `unknown bot credential: ${segment.slice(3)}` },
+        { status: 401 },
+      );
+    },
+  });
+  process.env["BRIDGE_TELEGRAM_API_BASE"] = `http://127.0.0.1:${server.port}`;
+  try {
+    const err = await getTelegramUpdates(padded, { timeoutSeconds: 1 }).catch((e) => e);
+    const surface = errorSurface(err);
+    expect(surface).not.toContain(TOKEN);
+    expect(surface).not.toContain("SUPER-SECRET");
+    expect((err as TelegramApiError).description).toContain("[redacted-token]");
+  } finally {
+    server.stop(true);
+  }
+});

@@ -92,8 +92,13 @@ export interface TelegramApiErrorInit {
  * The bot token is embedded in the Telegram request URL, and the runtime's own
  * network errors carry that URL (Bun exposes it as `err.path`). Letting a raw
  * error escape therefore prints the bot token to the terminal and to the daemon
- * stderr log. Nothing here ever stores or re-exposes the URL, and any text taken
- * from an underlying error has the token stripped out first.
+ * stderr log.
+ *
+ * Nothing here ever stores or re-exposes the URL, and EVERY field built from
+ * borrowed text — `message` and `description` alike — is passed through
+ * {@link redactToken} first. That matters beyond `message`: Bun's uncaught-error
+ * printer dumps an error's own properties, so a token surviving on `description`
+ * is just as exposed as one in the message.
  */
 export class TelegramApiError extends Error {
   readonly method: string;
@@ -113,9 +118,41 @@ export class TelegramApiError extends Error {
   }
 }
 
-/** Defence in depth: strip the token from any text borrowed from another error. */
+const REDACTED_TOKEN = "[redacted-token]";
+
+/**
+ * Any `/bot<id>:<secret>` path segment, whatever token it holds.
+ *
+ * The structural pass is what makes redaction robust: matching only the token we
+ * were handed misses a proxy echoing a redirect, another bot's path, or a
+ * percent-encoded form. `%` and `.` are in the class so a percent-escaped or
+ * dot-bearing secret is consumed whole rather than half-redacted.
+ */
+const BOT_TOKEN_PATH = /\/bot\d{5,}(?::|%3A|%3a)[A-Za-z0-9_%.-]{20,}/g;
+
+/**
+ * Strip the bot token from any text borrowed from another error or an upstream
+ * response, by value AND by shape.
+ *
+ * The value pass alone is not enough. WHATWG URL parsing strips `\n`, `\r` and
+ * `\t`, so a token read with `export TOKEN=$(cat tokenfile)` (trailing newline)
+ * goes on the wire CLEAN while an exact-substring search for the padded value
+ * matches nothing. Hence: the raw value, its trimmed form, and its
+ * percent-encoded forms, then the structural sweep as the backstop.
+ */
 function redactToken(text: string, token: string): string {
-  return token ? text.split(token).join("[redacted-token]") : text;
+  let out = text;
+  const variants = new Set<string>();
+  for (const candidate of [token, token.trim()]) {
+    if (!candidate) continue;
+    variants.add(candidate);
+    variants.add(encodeURIComponent(candidate));
+  }
+  // Longest first, so a shorter variant cannot leave a fragment of a longer one.
+  for (const variant of [...variants].sort((a, b) => b.length - a.length)) {
+    out = out.split(variant).join(REDACTED_TOKEN);
+  }
+  return out.replace(BOT_TOKEN_PATH, `/bot${REDACTED_TOKEN}`);
 }
 
 interface TelegramResponseBody {
@@ -153,9 +190,13 @@ async function telegramRequest(
 
   const body = await response.json().catch(() => undefined) as TelegramResponseBody | undefined;
   if (!response.ok || !body?.ok) {
-    const description = typeof body?.description === "string" ? body.description : undefined;
+    // Redact ONCE, up front: `description` is stored on the error as a public
+    // property, so it must be sanitised exactly like the message.
+    const description = typeof body?.description === "string"
+      ? redactToken(body.description, token)
+      : undefined;
     throw new TelegramApiError(
-      `Telegram ${method} failed (${response.status}): ${redactToken(description || "no description", token)}`,
+      `Telegram ${method} failed (${response.status}): ${description || "no description"}`,
       { method, status: response.status, description, retryAfterSeconds: retryAfterSeconds(body, response) },
     );
   }

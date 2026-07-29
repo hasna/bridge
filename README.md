@@ -1,100 +1,220 @@
 # bridge
 
-`bridge` connects local coding agents to external messaging channels. The local
-folder is `open-bridge`; the public package is `@hasna/bridge`; the CLI is
-`bridge`.
+`bridge` connects local coding agents to Telegram, iMessage, and local console
+channels. It provides durable per-conversation sessions, compatibility routes,
+background polling, outbound broadcasts, and an MCP server. The npm package is
+`@hasna/bridge`; the installed binaries are `bridge` and `bridge-mcp`.
+
+## Requirements
+
+- [Bun](https://bun.sh/) 1.0 or newer.
+- The CLI for each configured agent kind (`codewith`, `claude`, or
+  `aicopilot`). Shell agents use `sh`.
+- macOS, Messages, and the required Automation/Full Disk Access permissions for
+  iMessage.
 
 ## Install
 
 ```sh
 bun install -g @hasna/bridge
+bridge --version
 ```
 
-## Commands
+## Quick Start
 
-The `0.2.x` direction is session-first. A channel conversation attaches to a
-bridge session, and normal messages go to that session. Agent adapters that do
-not yet expose a stable create/send/resume API are marked `compatibility` in
-session state.
+Create a Telegram bot with BotFather, export its token, and configure an
+allowlisted chat:
 
-Session surface:
+```sh
+export TELEGRAM_BOT_TOKEN='123456:...'
+
+bridge init
+bridge channels add-telegram telegram-main \
+  --token-env TELEGRAM_BOT_TOKEN \
+  --allowed-chat-ids CHAT_ID \
+  --default-chat-id CHAT_ID \
+  --default-agent codewith
+bridge profiles add codewith-main \
+  --agent-kind codewith \
+  --auth-profile account001
+bridge agents add codewith --kind codewith --profile codewith-main
+bridge doctor
+bridge serve
+```
+
+The first authorized message in a conversation creates a bridge session and
+binding for the channel's `defaultAgentId`. If no default is set, bridge uses
+the only configured `codewith` agent; it does not guess when several codewith
+agents exist. Later messages resume the same durable session.
+
+Use `bridge daemon start` instead of `bridge serve` to poll in the background.
+
+## Routing Model
+
+Inbound messages follow this order:
+
+1. Reject disabled channels and senders outside the channel allowlist.
+2. Resume the session already bound to the normalized conversation.
+3. If no binding exists, create one for `defaultAgentId`, or for the sole
+   configured codewith agent.
+4. If no agent can be selected, try matching compatibility routes when serving
+   or when `sessions route-message --fallback-routes` is requested.
+5. Otherwise return session setup instructions without invoking an agent.
+
+Telegram forum topics have independent conversation IDs. iMessage group chats
+use their local Messages chat GUID so replies return to the group rather than
+only to the sender.
+
+Sessions can also be managed explicitly:
 
 ```sh
 bridge sessions list
+bridge sessions show SESSION_ID
 bridge sessions create --agent codewith --cwd /repo
-bridge sessions attach SESSION_ID --channel telegram-main --conversation 123456789
-bridge sessions use SESSION_ID --channel telegram-main --conversation 123456789
-bridge sessions detach --channel telegram-main --conversation 123456789
+bridge sessions attach SESSION_ID --channel telegram-main --conversation CHAT_ID
+bridge sessions use SESSION_ID --channel telegram-main --conversation CHAT_ID
+bridge sessions detach --channel telegram-main --conversation CHAT_ID
 bridge sessions pause SESSION_ID
 bridge sessions resume SESSION_ID
 bridge sessions close SESSION_ID
 bridge sessions send SESSION_ID "status"
 ```
 
-Route compatibility surface:
+`pause`, `resume`, and `close` update bridge-owned state. Compatibility adapters
+do not expose provider-side resume or cancellation; only the durable codewith
+adapter persists and resumes a provider thread.
+
+## Agents And Profiles
+
+Profiles hold reusable account and execution settings. Agents select a profile
+and may override its command, arguments, cwd, environment, or timeout.
 
 ```sh
-bridge init
-bridge doctor
-bridge channels add-telegram telegram-main --token-env TELEGRAM_BOT_TOKEN --allowed-chat-ids 123456789
-bridge channels add-imessage imessage-main --allowed-handles +15555550100 --default-handle +15555550100
-bridge profiles add codewith-main --agent-kind codewith --auth-profile account001 --cwd /Users/hasna
-bridge agents add codewith --kind codewith --profile codewith-main
-bridge routes add telegram-codewith --from telegram-main --to codewith --chat-ids 123456789
-bridge serve
-bridge daemon start
+bridge profiles add cw-primary \
+  --agent-kind codewith \
+  --auth-profile account001
+bridge profiles add cw-fallback \
+  --agent-kind codewith \
+  --auth-profile account002
+bridge agents add codewith \
+  --kind codewith \
+  --profile cw-primary \
+  --fallback-profile cw-fallback
 ```
 
-The session-backed multi-channel plan for the `0.2.x` release is tracked in
-[`docs/session-bridge-plan.md`](docs/session-bridge-plan.md).
+Durable codewith sessions run `codewith exec --json --durable` directly against
+one shared `CODEWITH_HOME`. On a structured usage, quota, or authentication
+exhaustion error, bridge tries each configured fallback profile at most once and
+resumes the same thread under the next billing account. A missing or expired
+thread is retried once as a fresh session and the user is told that prior context
+was not carried over.
 
-Useful inspection commands:
+Bridge codewith runs include `--skip-git-repo-check` and
+`--dangerously-bypass-approvals-and-sandbox`. They are intentionally
+unsandboxed and can write or execute anywhere available to the bridge process.
+Only configure agents and channels you trust.
+
+When no explicit session, agent, or profile cwd is configured, CLI `ask` and
+`serve` lazily provision an `agent-<name>` project directory and conversations
+channel. The default project root is
+`~/workspace/hasnaxyz/agent`; set `BRIDGE_AGENT_WORKSPACE_ROOT` to override it.
+Provisioning failures do not block an agent run and are retried later.
+
+Spawned agents do not inherit the whole bridge environment. Bridge passes a
+small runtime/toolchain allowlist, strips bridge channel secrets and
+credential-shaped variables, then applies explicit profile and agent `env`
+values. Advanced `envPassthrough` entries can be configured in JSON as exact
+names or `PREFIX*` globs.
+
+Claude and AIcopilot adapters currently run one CLI process per message and are
+recorded as compatibility sessions. A custom `command` also selects
+compatibility mode.
+
+## Channels
+
+### Telegram
+
+Telegram uses Bot API `getUpdates` long polling and `sendMessage`. Inbound and
+direct outbound messaging fail closed unless the chat is in `allowedChatIds` or
+`allowAllChats` is true. Routes may narrow that allowlist but cannot expand it.
+The optional `BRIDGE_TELEGRAM_API_BASE` override accepts only credential-free
+HTTP(S) URLs without query strings or fragments.
 
 ```sh
-bridge config path
-bridge config show
-bridge channels list
-bridge profiles list
-bridge agents list
-bridge routes list
+bridge send telegram-main CHAT_ID "hello"
+bridge route-message --channel telegram-main --chat-id CHAT_ID --text "status" --json
+bridge sessions route-message --channel telegram-main --chat-id CHAT_ID --text "status" --json
 ```
 
-## Broadcast
+### iMessage
 
-Outbound one-to-many posting to Telegram channels/groups (distinct from the
-inbound routing surface). Broadcasting fails closed: a chat id can only be
-posted to when it is listed in the channel's `broadcastChatIds` outbound
-allowlist or `allowAllBroadcasts` is explicitly enabled (mirroring the inbound
-`allowedChatIds` pattern).
+iMessage sending uses Messages automation through `osascript`. Optional receive
+mode polls `~/Library/Messages/chat.db`, ignores messages sent by the local user,
+and filters by handle, account, and service before advancing a per-channel row
+cursor.
+
+```sh
+bridge channels add-imessage imessage-main \
+  --allowed-handles +15555550100 \
+  --default-handle +15555550100
+bridge send imessage-main "hello"
+```
+
+Add `--receive` to enable database polling. Grant Full Disk Access to the
+terminal or service host if `bridge doctor` reports that `chat.db` is
+inaccessible. Use `--account` on multi-account Macs.
+
+### Console
+
+Console channels are useful for local sends, route probes, and broadcasts:
+
+```sh
+bridge channels add-console local
+bridge send local "hello"
+bridge broadcast local "release complete"
+```
+
+Webhook configuration is accepted by the library schema, but no webhook CLI,
+receiver, sender, or daemon poller is implemented yet.
+
+## Delivery And Recovery
+
+Runtime state includes sessions, bindings, channel cursors, broadcasts, and a
+message ledger. Bridge persists an inbound ledger entry before running an agent.
+Processing failures leave the cursor in place for retry. After five processing
+attempts by default, the message becomes `dead_letter`, the cursor advances, and
+bridge tries to send the user a clear failure reply.
+
+If the agent completes but sending its reply fails, bridge stores the response
+as `agent_completed` and retries delivery without rerunning the agent. Delivery
+has a separate ten-attempt budget; exhausting it advances the cursor but retains
+the answer and records an operator-facing error.
+
+Terminal ledger states are `delivered`, `skipped`, `unauthorized`, and
+`dead_letter`. `bridge serve --resume` reconciles interrupted state before
+polling. Process daemons enable resume by default; use `--no-resume` to opt out.
+
+## Broadcasts
+
+Telegram broadcasts use a separate outbound allowlist: `broadcastChatIds` or
+`allowAllBroadcasts`. Explicit `--targets` values still must pass that allowlist.
+Console broadcasts write one local post. iMessage and webhook broadcasts are not
+implemented.
 
 ```sh
 bridge channels add-telegram announce \
-  --token-env TELEGRAM_BOT_TOKEN \
-  --allowed-chat-ids 123456789 \
+  --allowed-chat-ids CHAT_ID \
   --broadcast-chat-ids -1002001,-1002002
 bridge broadcast announce "release v1.2.3 is live" --json
 bridge broadcasts list
 bridge broadcasts show BROADCAST_ID
 ```
 
-Every broadcast returns a per-post delivery status (`sent` with the Telegram
-`message_id`, `failed` with the error detail, or `skipped` when the target is
-not allowlisted) and the report is persisted in `state.json` under
-`broadcasts` (most recent 200). The CLI exits non-zero when any post failed.
-From code: `broadcast(config, channelRef, message)` in `src/lib/broadcast.ts`.
-Slack/Discord broadcast targets are out of scope for now.
+Reports record each target as `sent`, `failed`, or `skipped` and retain the most
+recent 200 broadcasts in state. The CLI exits non-zero when any target failed;
+use `--no-record` to skip persistence.
 
-Direct operations:
-
-```sh
-bridge send telegram-main 123456789 "hello"
-bridge send imessage-main +15555550100 "hello"
-bridge ask codewith "summarize this repo"
-bridge route-message --channel telegram-main --chat-id 123456789 --text "status" --json
-bridge sessions route-message --channel telegram-main --chat-id 123456789 --text "status" --json
-```
-
-Daemon operations:
+## Daemon
 
 ```sh
 bridge daemon start
@@ -104,190 +224,44 @@ bridge daemon restart
 bridge daemon stop
 ```
 
-`bridge daemon start` uses the process supervisor by default. It starts
-`bridge serve` in the background, inherits the current environment, and writes
-private metadata and logs under `~/.hasna/bridge/daemon`.
-
-For login-started services:
-
-```sh
-bridge daemon install --supervisor auto
-bridge daemon start --supervisor auto
-bridge daemon stop --supervisor auto
-bridge daemon uninstall --supervisor auto
-```
-
-`install` writes a user `launchd` file on macOS or a user `systemd` file on
-Linux. Telegram token values are not written to those files. Make token
-environment variables available to the user service manager before starting an
-installed daemon.
-
-macOS:
-
-```sh
-launchctl setenv TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN"
-bridge daemon start --supervisor launchd
-```
-
-Linux:
-
-```sh
-systemctl --user import-environment TELEGRAM_BOT_TOKEN
-bridge daemon start --supervisor systemd
-```
-
-## Profiles
-
-Profiles let one bridge process route messages to multiple accounts without
-changing global agent login state.
-
-Codewith:
-
-```sh
-bridge profiles add cw-account001 --agent-kind codewith --auth-profile account001 --cwd /repo
-bridge agents add codewith-main --kind codewith --profile cw-account001
-```
-
-Claude:
-
-```sh
-bridge profiles add claude-account001 --agent-kind claude --home ~/.hasna/accounts/profiles/claude/account001
-bridge agents add claude-main --kind claude --profile claude-account001
-```
-
-AIcopilot:
-
-```sh
-bridge profiles add aicopilot-main --agent-kind aicopilot --cwd /repo
-bridge agents add aicopilot-main --kind aicopilot --profile aicopilot-main
-```
+The default process supervisor inherits the current environment and stores
+private metadata and logs under `~/.hasna/bridge/daemon`. For login-managed
+services, `daemon install/start/stop/uninstall --supervisor auto` selects a user
+launchd service on macOS or systemd service on Linux. Supervisor files do not
+contain Telegram token values; import those variables into the service manager
+before starting.
 
 ## MCP
 
-`bridge-mcp` exposes:
+`bridge-mcp` is a stdio MCP server exposing:
 
-- `bridge_status`
-- `bridge_config`
-- `bridge_session_list`
-- `bridge_session_status`
-- `bridge_session_create`
-- `bridge_session_attach`
-- `bridge_session_send`
-- `bridge_session_route_message`
-- `bridge_route_message`
-- `bridge_broadcast`
-- `bridge_broadcast_reports`
+- `bridge_status` and redacted `bridge_config`
+- `bridge_session_list`, `bridge_session_status`, `bridge_session_create`,
+  `bridge_session_attach`, `bridge_session_send`, and
+  `bridge_session_route_message`
+- compatibility `bridge_route_message`
+- `bridge_broadcast` and `bridge_broadcast_reports`
 
-Use `bridge_session_route_message` for normal inbound channel behavior through
-session bindings. `bridge_route_message` remains for compatibility with explicit
-stateless routes.
+MCP tools use the default config and state paths. `bridge_session_send` invokes
+the agent but has no external response channel; inspect its structured result.
 
-## State
+## Files And Environment
 
-Default config path:
+Defaults:
 
-```sh
-~/.hasna/bridge/config.json
-```
+- Config: `~/.hasna/bridge/config.json` (`0600`)
+- State: `~/.hasna/bridge/state.json` (`0600`)
+- Daemon directory: `~/.hasna/bridge/daemon` (`0700`)
+- Daemon metadata and logs: `0600`
 
-Override with `BRIDGE_HOME` or `BRIDGE_CONFIG`.
+Set `BRIDGE_HOME` to move all defaults, or override config and state separately
+with `BRIDGE_CONFIG` and `BRIDGE_STATE`. `BRIDGE_DEBUG` prints action-handler
+stack traces after the normal one-line CLI error.
 
-`bridge` stores configuration and runtime state with private file permissions.
-Telegram bot tokens should stay in environment variables; config stores the env
-var name, not the token value. Telegram channels fail closed unless
-`allowedChatIds` are set or `allowAllChats` is explicitly enabled.
-Disabled channels do not match or deliver routes. Channel-level `allowedChatIds`
-are enforced before route matching, and long-poll offsets are persisted in
-`~/.hasna/bridge/state.json` so restarts do not replay already-seen terminal
-updates.
-MCP config inspection redacts profile and agent environment values.
+Config stores Telegram token environment variable names, not token values.
+Treat state and logs as sensitive because they contain prompts, responses,
+session references, delivery reports, and routing errors.
 
-Session state also lives in `~/.hasna/bridge/state.json`: `sessions`,
-`bindings`, `messageLedger`, and `cursors`. The daemon records inbound messages
-in the ledger and advances Telegram offsets only after a terminal state:
-delivered, skipped, or unauthorized. Failed messages remain retryable and do
-not advance the Telegram offset. If an agent succeeds but outbound delivery
-fails, the response is stored as `agent_completed` so retry delivery does not
-re-run the agent.
-
-Daemon metadata and logs are private as well. Logs can contain prompts and agent
-responses, so treat them as sensitive.
-
-## Telegram Smoke Test
-
-Create a bot with BotFather and set the token only in your shell:
-
-```sh
-export TELEGRAM_BOT_TOKEN='123456:...'
-```
-
-Send any message to the bot from the Telegram account or group you want to use,
-then find the chat id:
-
-```sh
-curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates"
-```
-
-Configure one allowed chat and a test shell agent:
-
-```sh
-bridge init
-bridge channels add-telegram telegram-main --token-env TELEGRAM_BOT_TOKEN --allowed-chat-ids CHAT_ID --default-chat-id CHAT_ID
-bridge profiles add shell-echo --agent-kind shell --command printf --arg 'bridge ok: {prompt}'
-bridge agents add echo --kind shell --profile shell-echo
-bridge sessions create --id test-session --agent echo
-bridge sessions attach test-session --channel telegram-main --conversation CHAT_ID
-bridge doctor
-bridge daemon start
-bridge daemon status
-```
-
-Send a plain Telegram message to the bot. It should reply with `bridge ok: ...`
-without any prefix.
-Inspect logs with `bridge daemon logs`, then stop it with `bridge daemon stop`.
-
-For Telegram forum topics, use `CHAT_ID:THREAD_ID` as the conversation value.
-
-For the first live test, use the default process supervisor above because it
-inherits `TELEGRAM_BOT_TOKEN` from your shell. Move to launchd/systemd after that
-works.
-
-## iMessage
-
-iMessage is a local macOS channel. Sending uses the Messages app through
-`osascript`, so macOS may ask for Automation permission for the terminal or
-daemon host process.
-
-Configure a send-only channel:
-
-```sh
-bridge channels add-imessage imessage-main --allowed-handles +15555550100 --default-handle +15555550100
-bridge send imessage-main "hello"
-```
-
-If your Mac has more than one Messages account, add the account selector:
-
-```sh
-bridge channels add-imessage imessage-main --allowed-handles +15555550100 --account you@example.com
-```
-
-For receive mode, configured accounts are also used as a filter when Messages
-stores account metadata in `chat.db`. If an account is configured but an inbound
-row has no matching account metadata, the row is skipped rather than routed.
-
-Enable local receive polling only when you are comfortable granting the daemon
-host access to Messages data:
-
-```sh
-bridge channels add-imessage imessage-main --allowed-handles +15555550100 --receive
-bridge sessions attach SESSION_ID --channel imessage-main --conversation +15555550100
-bridge daemon restart
-```
-
-Receive mode reads `~/Library/Messages/chat.db`. If `bridge doctor` reports a
-chat database permission failure, grant Full Disk Access to the terminal or
-service host, or recreate the channel without `--receive`.
-
-Inbound direct chats bind by handle. Group chats bind by local Messages chat id,
-shown internally as `chat:<guid>`, and replies go back to that chat after the
-sender handle passes the channel allowlist.
+See [`docs/architecture.md`](docs/architecture.md) for the runtime design. The
+historical implementation plan is retained in
+[`docs/session-bridge-plan.md`](docs/session-bridge-plan.md).

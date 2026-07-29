@@ -99,7 +99,22 @@ const routeSchema = z.object({
   enabled: z.boolean().optional(),
   match: z.object({
     chatIds: z.array(z.string()).optional(),
-    textRegex: z.string().optional(),
+    // Validated here so an unusable pattern can never be persisted. Compiling it
+    // lazily inside matchingRoutes throws a raw SyntaxError on every inbound
+    // message, and because the poll offset only advances on a terminal outcome
+    // that wedges the channel permanently.
+    textRegex: z.string().optional().refine(
+      (value) => {
+        if (value === undefined) return true;
+        try {
+          new RegExp(value);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      { message: "textRegex must be a valid regular expression" },
+    ),
   }).optional(),
 });
 

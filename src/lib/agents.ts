@@ -1,5 +1,6 @@
+import { spawn as spawnChildProcess, type ChildProcess } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { constants as osConstants, homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentConfig, AgentRunInput, AgentRunResult, AgentSessionRef, BridgeConfig, BridgeMessage, BridgeSession, ProfileConfig } from "../types.js";
 import { ensureAgentWorkspace, type ProvisionDeps } from "./provision.js";
@@ -553,32 +554,230 @@ export async function sendAgentSessionMessage(
 
 // ─── spawning ─────────────────────────────────────────────────────────────────
 
-export const defaultAgentSpawn: AgentSpawn = async (command, options) => {
-  const started = Bun.spawn(command, {
+/**
+ * Grace period allowed between SIGTERM and SIGKILL — and again after SIGKILL —
+ * when a run exceeds its timeout. Every wait in the kill path is bounded, so
+ * {@link spawnAgentProcess} always returns within roughly
+ * `timeoutMs + 2 * killGraceMs` no matter how badly the agent misbehaves.
+ */
+export const AGENT_KILL_GRACE_MS = 2_000;
+
+/**
+ * Cap on stdout/stderr captured per run. A full-YOLO codewith run emits a
+ * `--json` event for every tool call, so one turn can produce hundreds of
+ * megabytes; buffering all of it (and then splitting the whole blob again in
+ * `extractCodewith*`) is an out-of-memory kill of the bridge daemon.
+ */
+export const AGENT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+
+export interface SpawnAgentOptions {
+  cwd?: string;
+  env?: Record<string, string>;
+  timeoutMs: number;
+  /** Override for {@link AGENT_KILL_GRACE_MS} (tests / tuning). */
+  killGraceMs?: number;
+  /** Override for {@link AGENT_MAX_OUTPUT_BYTES} (tests / tuning). */
+  maxOutputBytes?: number;
+}
+
+interface BoundedCapture {
+  push(chunk: Buffer): void;
+  text(): string;
+}
+
+/**
+ * Accumulates subprocess output under a hard byte cap by keeping the HEAD and
+ * the TAIL of the stream and dropping the middle. Both ends carry meaning for
+ * codewith `--json` output: the session-start event (`thread.started`, the
+ * thread id we must persist) is emitted first, and the final assistant message
+ * last. The dropped span is replaced by a non-JSON marker line, which every
+ * JSONL reader in this module already skips.
+ */
+function createBoundedCapture(limit: number): BoundedCapture {
+  const half = Math.max(1, Math.floor(limit / 2));
+  const head: Buffer[] = [];
+  const tail: Buffer[] = [];
+  let headBytes = 0;
+  let tailBytes = 0;
+  let dropped = 0;
+
+  return {
+    push(chunk) {
+      let rest = chunk;
+      if (headBytes < half) {
+        const take = Math.min(rest.length, half - headBytes);
+        head.push(rest.subarray(0, take));
+        headBytes += take;
+        rest = rest.subarray(take);
+      }
+      if (!rest.length) return;
+      tail.push(rest);
+      tailBytes += rest.length;
+      while (tailBytes > half && tail.length > 1) {
+        const evicted = tail.shift()!;
+        tailBytes -= evicted.length;
+        dropped += evicted.length;
+      }
+      if (tailBytes > half) {
+        const only = tail[0]!;
+        const keep = only.subarray(only.length - half);
+        dropped += only.length - keep.length;
+        tail[0] = keep;
+        tailBytes = keep.length;
+      }
+    },
+    text() {
+      const headText = Buffer.concat(head).toString("utf-8");
+      const tailText = Buffer.concat(tail).toString("utf-8");
+      if (!dropped) return headText + tailText;
+      return `${headText}\n… ${dropped} bytes of agent output omitted …\n${tailText}`;
+    },
+  };
+}
+
+/** Resolves true if `promise` settles within `ms`, false on timeout. Never hangs. */
+function settledWithin(promise: Promise<void>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise.then(() => true),
+    new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), Math.max(0, ms));
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/**
+ * Shell-convention exit code for a signal death (128 + signal number), so a
+ * SIGKILLed (e.g. OOM-killed) agent surfaces as a NON-ZERO exit rather than the
+ * `null` that callers' `exitCode !== 0` checks read as a clean, empty run.
+ */
+function signalExitCode(signal: NodeJS.Signals | null): number | null {
+  if (!signal) return null;
+  const numbers = osConstants.signals as unknown as Record<string, number | undefined>;
+  const num = numbers[signal];
+  return typeof num === "number" ? 128 + num : 1;
+}
+
+/**
+ * Kills the agent's whole process group. `detached: true` puts the agent in its
+ * own group, so the negative-pid signal also reaches every shell and tool the
+ * agent spawned. Killing only the direct child leaves those survivors holding
+ * the stdout pipe open (which is what made the old timeout hang) and orphaned
+ * on the station.
+ */
+function killAgentTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  const pid = child.pid;
+  if (pid === undefined) return;
+  try {
+    process.kill(-pid, signal);
+    return;
+  } catch {
+    // No process group (non-POSIX) or the group is already gone.
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // Already exited.
+  }
+}
+
+/** Agent process groups still running, killed if the station process exits. */
+const liveAgentPids = new Set<number>();
+let exitHookInstalled = false;
+
+/**
+ * `detached: true` means an agent survives its parent by default. Reap any
+ * still-running agent when the station process exits normally, so a graceful
+ * daemon stop does not leave a codewith run behind.
+ */
+function ensureExitHook(): void {
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+  process.on("exit", () => {
+    for (const pid of liveAgentPids) {
+      try {
+        process.kill(-pid, "SIGTERM");
+      } catch {
+        // Already gone.
+      }
+    }
+  });
+}
+
+/**
+ * Runs an agent command with a timeout that is actually enforced.
+ *
+ * Output is drained CONCURRENTLY with the exit wait and captured under a byte
+ * cap; on timeout the whole process group gets SIGTERM, then SIGKILL after a
+ * grace period. Every wait is bounded, so this resolves even when a process
+ * outside our reach still holds the pipes open — the previous implementation
+ * awaited the stdout read after a lone SIGTERM to the direct child and could
+ * block forever, wedging the serve loop for every channel.
+ */
+export async function spawnAgentProcess(command: string[], options: SpawnAgentOptions): Promise<SpawnResult> {
+  const [file, ...args] = command;
+  if (!file) throw new Error("Cannot spawn an agent with an empty command");
+  const graceMs = options.killGraceMs ?? AGENT_KILL_GRACE_MS;
+  const limit = options.maxOutputBytes ?? AGENT_MAX_OUTPUT_BYTES;
+
+  ensureExitHook();
+  const child = spawnChildProcess(file, args, {
     cwd: options.cwd,
     env: options.env,
-    stdout: "pipe",
-    stderr: "pipe",
+    stdio: ["ignore", "pipe", "pipe"],
+    // Own process group, so a timeout can kill the agent AND everything it
+    // spawned instead of leaving survivors that keep the pipes open.
+    detached: true,
+  });
+  if (child.pid !== undefined) liveAgentPids.add(child.pid);
+
+  const stdout = createBoundedCapture(limit);
+  const stderr = createBoundedCapture(limit);
+  child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+  child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
+  // A broken pipe after a kill must never take the station down.
+  child.stdout?.on("error", () => undefined);
+  child.stderr?.on("error", () => undefined);
+
+  let exitCode: number | null = null;
+  let spawnError: Error | undefined;
+  // `close` fires once the process has exited AND its pipes are drained/closed.
+  const closed = new Promise<void>((resolve) => {
+    child.once("error", (err: Error) => {
+      spawnError = err;
+      resolve();
+    });
+    child.once("exit", (code, signal) => {
+      exitCode = code ?? signalExitCode(signal);
+    });
+    child.once("close", () => resolve());
   });
 
-  let timedOut = false;
-  let timer: Timer | undefined;
-  const result = await Promise.race([
-    started.exited,
-    new Promise<number | null>((resolve) => {
-      timer = setTimeout(() => {
-        timedOut = true;
-        started.kill();
-        resolve(null);
-      }, options.timeoutMs);
-    }),
-  ]);
-  if (timer) clearTimeout(timer);
+  try {
+    const finished = await settledWithin(closed, options.timeoutMs);
+    if (finished) {
+      if (spawnError) throw spawnError;
+      return { exitCode, stdout: stdout.text(), stderr: stderr.text(), timedOut: false };
+    }
 
-  const stdout = await new Response(started.stdout).text();
-  const stderr = await new Response(started.stderr).text();
-  return { exitCode: result, stdout, stderr, timedOut };
-};
+    killAgentTree(child, "SIGTERM");
+    if (!(await settledWithin(closed, graceMs))) {
+      killAgentTree(child, "SIGKILL");
+      // Bounded on purpose: if something outside the group still holds a pipe,
+      // return the output captured so far rather than blocking the bridge.
+      await settledWithin(closed, graceMs);
+    }
+    if (spawnError) throw spawnError;
+    // A timed-out run reports no exit code; callers gate on `timedOut`.
+    return { exitCode: null, stdout: stdout.text(), stderr: stderr.text(), timedOut: true };
+  } finally {
+    if (child.pid !== undefined) liveAgentPids.delete(child.pid);
+  }
+}
+
+export const defaultAgentSpawn: AgentSpawn = (command, options) => spawnAgentProcess(command, options);
 
 async function defaultReadOutput(path: string): Promise<string | undefined> {
   try {

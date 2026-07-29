@@ -1,7 +1,13 @@
 import { expect, test } from "bun:test";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   createBridgeSession,
+  loadState,
+  saveState,
   sendBridgeSessionMessage,
+  withSessionStateTurn,
   type AgentRunResult,
   type BridgeConfig,
   type BridgeState,
@@ -69,10 +75,73 @@ test("two concurrent messages for the same session run one at a time", async () 
 
   // Serialised: the two turns never overlap.
   expect(maxActive).toBe(1);
-  // And because they are serialised, the second turn sees the thread id the
-  // first one established, so it resumes instead of forking a new thread.
+  // Both turns share ONE state object here (the serve loop and the CLI pass the
+  // state they loaded straight through), so serialisation alone is enough for
+  // the second turn to see the thread id the first established. Callers that
+  // parse a snapshot per invocation need `withSessionStateTurn` as well — see
+  // the independent-snapshot regression below.
   expect(resumedIds[0]).toBeUndefined();
   expect(resumedIds[1]).toBe(SID);
+});
+
+/**
+ * Regression: serialising the agent run is NOT enough for callers that own state
+ * persistence. `bridge_session_send` / `bridge_session_route_message` each do
+ * `loadState()` -> send -> `saveState()`, so two concurrent invocations parse two
+ * independent state objects. With only the run serialised, the queued turn enters
+ * the lock holding a pre-predecessor snapshot: it resumes NOTHING, forks a second
+ * codewith thread for the conversation, and its trailing save clobbers the thread
+ * id the first turn recorded — the user's next message starts over with no
+ * context.
+ *
+ * The load and the save must therefore happen inside the lock, which is what
+ * {@link withSessionStateTurn} (used by both MCP tools) does.
+ */
+test("concurrent callers with independent state snapshots resume the first thread", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-session-turn-"));
+  const statePath = join(dir, "state.json");
+  const seed = makeState();
+  const session = createBridgeSession(config, seed, { agentId: "cw" });
+  await saveState(seed, statePath);
+
+  const store = {
+    load: () => loadState(statePath),
+    save: (state: BridgeState) => saveState(state, statePath),
+  };
+
+  const resumedIds: (string | undefined)[] = [];
+  let threads = 0;
+  const run = async (
+    _config: BridgeConfig,
+    agentId: string,
+    input: { session?: { agentSession?: { refId?: string } } },
+  ): Promise<AgentRunResult> => {
+    // A resumed thread keeps its id; a fresh one forks a new thread, exactly as
+    // `codewith exec [resume <id>]` behaves.
+    const resumed = input.session?.agentSession?.refId;
+    resumedIds.push(resumed);
+    const threadId = resumed || `${SID}-${(threads += 1)}`;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    return {
+      agentId, command: ["codewith"], exitCode: 0, stdout: "{}", stderr: "", timedOut: false,
+      stdoutStructured: true, replyText: "ok", providerSessionId: threadId, authProfile: "account088",
+    };
+  };
+
+  const send = (id: string) =>
+    withSessionStateTurn(session.id, store, (state) =>
+      sendBridgeSessionMessage(config, state, session.id, msg(id), { run: run as never, writeConsole: false }));
+
+  await Promise.all([send("a"), send("b")]);
+
+  expect(resumedIds[0]).toBeUndefined();
+  // The queued turn re-read state under the lock, so it resumes turn A's thread
+  // instead of forking `${SID}-2`.
+  expect(resumedIds[1]).toBe(`${SID}-1`);
+  expect(threads).toBe(1);
+  // And turn B's save did not clobber the thread id turn A persisted.
+  const persisted = await loadState(statePath);
+  expect(persisted.sessions[session.id]?.agentSession?.refId).toBe(`${SID}-1`);
 });
 
 test("different sessions still run in parallel", async () => {

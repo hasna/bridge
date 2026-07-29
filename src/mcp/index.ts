@@ -15,15 +15,26 @@ import {
   listBridgeSessions,
   loadConfig,
   loadState,
+  messageSessionId,
   redactConfig,
   routeMessage,
   saveState,
   sendBridgeSessionMessage,
+  withSessionStateTurn,
+  type SessionStateStore,
 } from "../index.js";
 
 function text(value: unknown) {
   return { content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] };
 }
+
+/**
+ * State store for the message-sending tools. The MCP SDK does not serialise tool
+ * invocations, so each call would otherwise parse its own state snapshot and the
+ * later one would overwrite whatever the earlier turn persisted; passing this to
+ * `withSessionStateTurn` moves the load and the save inside the session lock.
+ */
+const stateStore: SessionStateStore = { load: () => loadState(), save: (state) => saveState(state) };
 
 export function buildServer(): McpServer {
   const server = new McpServer({ name: "bridge", version: "0.2.1" });
@@ -86,14 +97,13 @@ export function buildServer(): McpServer {
     },
     async (args) => {
       const config = await loadConfig();
-      const state = await loadState();
-      const result = await sendBridgeSessionMessage(config, state, args.sessionId, {
-        id: `mcp:${Date.now()}`,
-        channelId: "mcp",
-        text: args.text,
-        receivedAt: new Date().toISOString(),
-      }, { writeConsole: false });
-      await saveState(state);
+      const result = await withSessionStateTurn(args.sessionId, stateStore, (state) =>
+        sendBridgeSessionMessage(config, state, args.sessionId, {
+          id: `mcp:${Date.now()}`,
+          channelId: "mcp",
+          text: args.text,
+          receivedAt: new Date().toISOString(),
+        }, { writeConsole: false }));
       return text(result);
     },
   );
@@ -110,8 +120,7 @@ export function buildServer(): McpServer {
     },
     async (args) => {
       const config = await loadConfig();
-      const state = await loadState();
-      const result = await dispatchMessageWithSessions(config, state, {
+      const message = {
         id: `mcp:${Date.now()}`,
         channelId: args.channelId,
         text: args.text,
@@ -119,12 +128,17 @@ export function buildServer(): McpServer {
         threadId: args.threadId,
         from: args.from,
         receivedAt: new Date().toISOString(),
-      }, {
-        writeConsole: false,
-        fallbackToRoutes: Boolean(args.fallbackRoutes),
-        persistState: async (nextState) => saveState(nextState),
-      });
-      await saveState(state);
+      };
+      // The lock key is the bound session, which is only knowable from state; the
+      // turn re-reads state under the lock, so this probe read is a key lookup
+      // and never the snapshot the turn runs on.
+      const sessionId = messageSessionId(config, await loadState(), message);
+      const result = await withSessionStateTurn(sessionId, stateStore, (state) =>
+        dispatchMessageWithSessions(config, state, message, {
+          writeConsole: false,
+          fallbackToRoutes: Boolean(args.fallbackRoutes),
+          persistState: (nextState) => stateStore.save(nextState),
+        }));
       return text(result);
     },
   );

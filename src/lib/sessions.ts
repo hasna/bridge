@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type {
   AgentRunResult,
@@ -388,19 +389,83 @@ function bindingAuthorized(binding: BridgeBinding, message: BridgeMessage): bool
 const sessionTurnQueues = new Map<string, Promise<unknown>>();
 
 /**
+ * Session ids whose turn lock is already held by the current async context.
+ * Acquisition must be re-entrant: callers that own state persistence hold the
+ * lock across their whole load -> send -> save (see
+ * {@link withSessionStateTurn}), and the send path takes the same lock
+ * internally — a second non-re-entrant acquire would queue behind itself and
+ * wedge the conversation forever.
+ */
+const heldSessionLocks = new AsyncLocalStorage<ReadonlySet<string>>();
+
+/**
  * Runs `fn` after any turn already queued for `sessionId`. Predecessor failures
  * never poison the queue, and the map entry is dropped once the tail settles, so
  * a failing agent run cannot deadlock the conversation.
  */
 export function withSessionTurnLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+  const held = heldSessionLocks.getStore();
+  if (held?.has(sessionId)) return fn();
+  const owned = new Set(held || []).add(sessionId);
   const previous = sessionTurnQueues.get(sessionId) || Promise.resolve();
-  const run = previous.then(fn);
+  const run = previous.then(() => heldSessionLocks.run(owned, fn));
   const tail = run.then(() => undefined, () => undefined);
   sessionTurnQueues.set(sessionId, tail);
   void tail.then(() => {
     if (sessionTurnQueues.get(sessionId) === tail) sessionTurnQueues.delete(sessionId);
   });
   return run;
+}
+
+/** Reads and writes the persisted bridge state a turn operates on. */
+export interface SessionStateStore {
+  load: () => Promise<BridgeState>;
+  save: (state: BridgeState) => Promise<void>;
+}
+
+/**
+ * Runs one turn as a single critical section: the state snapshot is both READ
+ * and WRITTEN inside the session turn lock.
+ *
+ * Callers that own persistence — the `bridge_session_send` /
+ * `bridge_session_route_message` MCP tools — must use this instead of
+ * load -> send -> save wrapped around the lock. Each tool invocation parses its
+ * own state object, so a turn that loaded before its predecessor ran would enter
+ * the lock holding a pre-predecessor snapshot: it would resume nothing, fork a
+ * SECOND codewith thread for the conversation, and its trailing save would
+ * clobber the thread id (plus the ledger entry, binding and offsets) the first
+ * turn recorded. Serialising the agent run alone does not prevent that.
+ *
+ * `sessionId` is undefined when the conversation has no binding yet: there is no
+ * session to serialise on, and the turn's own {@link sendBridgeSessionMessage}
+ * takes the lock once one exists.
+ */
+export async function withSessionStateTurn<T>(
+  sessionId: string | undefined,
+  store: SessionStateStore,
+  fn: (state: BridgeState) => Promise<T>,
+): Promise<T> {
+  const turn = async (): Promise<T> => {
+    const state = await store.load();
+    const result = await fn(state);
+    await store.save(state);
+    return result;
+  };
+  return sessionId ? withSessionTurnLock(sessionId, turn) : turn();
+}
+
+/**
+ * The session a message would be dispatched to, resolved from its conversation
+ * binding. Callers that own persistence need this key BEFORE they read state
+ * inside the lock, so the whole load -> dispatch -> save is one critical
+ * section; `undefined` means the conversation has no binding yet.
+ */
+export function messageSessionId(
+  config: BridgeConfig,
+  state: BridgeState,
+  message: BridgeMessage,
+): string | undefined {
+  return findBridgeBinding(config, state, message)?.activeSessionId;
 }
 
 export function sendBridgeSessionMessage(
@@ -410,8 +475,12 @@ export function sendBridgeSessionMessage(
   message: BridgeMessage,
   options: SessionMessageOptions = {},
 ): Promise<SessionMessageResult> {
-  // Re-read the session INSIDE the lock: a queued turn must see the thread id
-  // and auth profile the preceding turn recorded, not a stale snapshot.
+  // The session is read INSIDE the lock, so a queued turn sees the thread id and
+  // auth profile the preceding turn recorded — but only as far as `state` is the
+  // same object the preceding turn mutated. A caller that parses its own
+  // snapshot per invocation must take the lock around its load AND its save via
+  // {@link withSessionStateTurn}, or the queued turn still enters with a
+  // pre-predecessor view.
   return withSessionTurnLock(sessionId, () => runBridgeSessionTurn(config, state, sessionId, message, options));
 }
 

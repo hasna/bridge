@@ -16,6 +16,15 @@ import {
  */
 export const DEFAULT_MAX_ATTEMPTS = 5;
 
+/**
+ * How many times an already-produced reply may be re-sent before the poll cursor
+ * moves on. Deliberately larger and separate from {@link DEFAULT_MAX_ATTEMPTS}:
+ * redelivery is cheap (the agent is not re-run, the stored reply is re-sent) and
+ * transport outages are usually transient, so it is worth trying much harder
+ * before giving up on an answer that already exists.
+ */
+export const DEFAULT_MAX_DELIVERY_ATTEMPTS = 10;
+
 export interface MissingTelegramToken {
   channelId: string;
   envVar: string;
@@ -74,9 +83,19 @@ export function pollBackoffMs(input: PollBackoffInput): number {
 }
 
 export interface HandleInboundOptions extends SessionMessageOptions {
+  /** Cap on attempts at *processing* the message (running the agent). */
   maxAttempts?: number;
+  /** Cap on attempts at *delivering* a reply the agent already produced. */
+  maxDeliveryAttempts?: number;
   /** Invoked when a message is moved to dead-letter, e.g. to notify the sender. */
   onDeadLetter?: (message: BridgeMessage, entry: MessageLedgerEntry) => Promise<void> | void;
+  /**
+   * Invoked when a reply the agent already produced could not be delivered
+   * within the delivery budget. The reply stays in the ledger; this is an
+   * operator signal, NOT a message to the sender — the transport to them is
+   * exactly what is broken.
+   */
+  onDeliveryExhausted?: (message: BridgeMessage, entry: MessageLedgerEntry) => Promise<void> | void;
 }
 
 export interface InboundOutcome {
@@ -84,6 +103,11 @@ export interface InboundOutcome {
   /** True when the poll cursor/offset may advance past this message. */
   advanceOffset: boolean;
   deadLettered: boolean;
+  /**
+   * True when an already-produced reply hit the delivery budget. The message was
+   * processed successfully; only the send failed, so this is never a dead-letter.
+   */
+  deliveryExhausted: boolean;
   result: DispatchMessageResult;
   error?: string;
 }
@@ -106,6 +130,15 @@ function markDeadLetter(entry: MessageLedgerEntry, error: string): void {
  * - Retryable failure at/over the cap -> dead-letter and advance, so a poison
  *   message cannot block every newer update behind it.
  *
+ * PROCESSING and DELIVERY failures are accounted separately. Once the ledger
+ * reaches `agent_completed` the agent has produced an answer and it is stored in
+ * `entry.responseText`; a later failure is a transport problem. Charging that to
+ * the processing budget dead-lettered fully answered messages and told the sender
+ * "I could not process that message" — wrong, and it discarded a real answer. A
+ * delivery failure therefore consumes {@link MessageLedgerEntry.deliveryAttempts}
+ * against `maxDeliveryAttempts`, never dead-letters, and leaves the entry
+ * non-terminal so the stored reply is redelivered rather than recomputed.
+ *
  * Idempotency is inherited from the message ledger: an already-terminal message
  * short-circuits without re-invoking the agent, so replaying from a persisted
  * offset never duplicates work.
@@ -117,23 +150,56 @@ export async function handleInboundMessage(
   options: HandleInboundOptions = {},
 ): Promise<InboundOutcome> {
   const maxAttempts = Math.max(1, options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
+  const maxDeliveryAttempts = Math.max(1, options.maxDeliveryAttempts ?? DEFAULT_MAX_DELIVERY_ATTEMPTS);
   try {
     const result = await dispatchMessageWithSessions(config, state, message, options);
     const status = result.ledger?.status ?? "processing";
     if (isTerminalLedgerStatus(status)) {
-      return { ledgerStatus: status, advanceOffset: true, deadLettered: false, result };
+      return { ledgerStatus: status, advanceOffset: true, deadLettered: false, deliveryExhausted: false, result };
     }
     // Non-terminal (processing/agent_completed): interrupted before delivery.
     return {
       ledgerStatus: status,
       advanceOffset: false,
       deadLettered: false,
+      deliveryExhausted: false,
       result,
       error: result.ledger?.error,
     };
   } catch (err) {
     const errorText = err instanceof Error ? err.message : String(err);
     const entry = state.messageLedger[ledgerId(message)];
+
+    // The agent already answered: this is a delivery failure, on its own budget.
+    if (entry?.status === "agent_completed") {
+      entry.deliveryAttempts = (entry.deliveryAttempts ?? 0) + 1;
+      entry.error = errorText;
+      entry.updatedAt = new Date().toISOString();
+      if (entry.deliveryAttempts >= maxDeliveryAttempts) {
+        // Advance so one undeliverable conversation cannot block every newer
+        // message, but keep the entry non-terminal with its responseText intact:
+        // the answer is retained and redeliverable, never dead-lettered, and the
+        // sender is not told their message failed to process.
+        await options.onDeliveryExhausted?.(message, entry);
+        return {
+          ledgerStatus: entry.status,
+          advanceOffset: true,
+          deadLettered: false,
+          deliveryExhausted: true,
+          result: { message, ledger: entry },
+          error: errorText,
+        };
+      }
+      return {
+        ledgerStatus: entry.status,
+        advanceOffset: false,
+        deadLettered: false,
+        deliveryExhausted: false,
+        result: { message, ledger: entry },
+        error: errorText,
+      };
+    }
+
     const attempts = entry?.attempts ?? 1;
     if (entry && attempts >= maxAttempts) {
       markDeadLetter(entry, errorText);
@@ -142,6 +208,7 @@ export async function handleInboundMessage(
         ledgerStatus: "dead_letter",
         advanceOffset: true,
         deadLettered: true,
+        deliveryExhausted: false,
         result: { message, ledger: entry },
         error: errorText,
       };
@@ -150,6 +217,7 @@ export async function handleInboundMessage(
       ledgerStatus: entry?.status ?? "failed",
       advanceOffset: false,
       deadLettered: false,
+      deliveryExhausted: false,
       result: { message, ledger: entry ?? undefined },
       error: errorText,
     };

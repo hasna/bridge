@@ -386,7 +386,10 @@ test("stale daemon metadata is reported and cleaned on stop", async () => {
     stderrLog: paths.stderrLog,
   }, null, 2));
 
-  const status = await daemonStatus({ daemonDir: dir });
+  // `daemonStatus` now reaps metadata whose process is gone, so the detection
+  // half of this test asks for a pure read (reap: false). The cleanup half below
+  // is unchanged.
+  const status = await daemonStatus({ daemonDir: dir, reap: false });
   expect(status.stale).toBe(true);
 
   const stopped = await stopProcessDaemon({ daemonDir: dir });

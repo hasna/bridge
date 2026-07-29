@@ -152,11 +152,32 @@ function rowMatchesService(channel: IMessageChannelConfig, row: {
   return candidates.some((value) => valueMatchesConfigured(value, expected));
 }
 
-export function getIMessageMessages(
+export interface IMessagePage {
+  /** Deliverable rows, at most `limit` of them. */
+  rows: IMessageRow[];
+  /**
+   * Highest ROWID the caller may advance its cursor to. This is the last row
+   * the poll actually accounted for: the last returned row when the page was
+   * truncated by `limit`, otherwise the last row scanned (so rows rejected by
+   * the allowlist/account/service filters are stepped over rather than
+   * re-scanned forever). `undefined` when the scan window was empty.
+   */
+  scannedThroughRowId?: number;
+}
+
+/**
+ * One page of inbound rows plus the cursor position the caller should persist.
+ *
+ * Advancing only to the last *delivered* row means a scan window containing no
+ * deliverable rows reports no progress at all, so the same window is re-scanned
+ * on every poll and any allowed message beyond it is never reached — a busy Mac
+ * with enough non-allowlisted traffic makes the channel permanently deaf.
+ */
+export function getIMessageMessagePage(
   channel: IMessageChannelConfig,
   options: { afterRowId?: number; limit?: number } = {},
-): IMessageRow[] {
-  if ((channel.receiveMode || "disabled") !== "chat-db") return [];
+): IMessagePage {
+  if ((channel.receiveMode || "disabled") !== "chat-db") return { rows: [] };
   const db = new Database(getIMessageDbPath(channel), { readonly: true });
   try {
     const messageColumns = tableColumns(db, "message");
@@ -201,7 +222,7 @@ export function getIMessageMessages(
       text?: string;
       date?: number;
     }>;
-    return rows
+    const allowed = rows
       .filter((row) =>
         row.handle
         && row.text
@@ -209,7 +230,6 @@ export function getIMessageMessages(
         && rowMatchesAccount(channel, row)
         && rowMatchesService(channel, row)
       )
-      .slice(0, limit)
       .map((row) => {
         const item: IMessageRow = { rowId: row.rowId, handle: row.handle!, text: row.text!, date: row.date };
         if (row.account) item.account = row.account;
@@ -219,9 +239,24 @@ export function getIMessageMessages(
         if (row.displayName) item.displayName = row.displayName;
         return item;
       });
+
+    const page = allowed.slice(0, limit);
+    // Truncated by `limit`: the remaining allowed rows have NOT been accounted
+    // for, so the cursor must stop at the last row we are handing back.
+    const scannedThroughRowId = allowed.length > limit
+      ? page[page.length - 1]?.rowId
+      : rows[rows.length - 1]?.rowId;
+    return scannedThroughRowId === undefined ? { rows: page } : { rows: page, scannedThroughRowId };
   } finally {
     db.close();
   }
+}
+
+export function getIMessageMessages(
+  channel: IMessageChannelConfig,
+  options: { afterRowId?: number; limit?: number } = {},
+): IMessageRow[] {
+  return getIMessageMessagePage(channel, options).rows;
 }
 
 export function imessageRowToMessage(channelId: string, row: IMessageRow): BridgeMessage {

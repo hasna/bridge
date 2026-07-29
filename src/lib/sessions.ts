@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type {
   AgentRunResult,
@@ -374,12 +375,121 @@ function bindingAuthorized(binding: BridgeBinding, message: BridgeMessage): bool
   return true;
 }
 
-export async function sendBridgeSessionMessage(
+/**
+ * In-flight turn per bridge session, so a session processes ONE message at a
+ * time. Nothing else serialises this: `bridge_session_send` /
+ * `bridge_session_route_message` are MCP tools and the MCP SDK does not
+ * serialise tool calls, so two messages for the same session could run
+ * concurrently. Both turns would then execute
+ * `codewith exec resume <same thread id>` against the SAME rollout file in the
+ * shared codewith home (the very thing the shared thread store exists for) and
+ * race to write the session ref back — an interleaved codewith thread and a lost
+ * thread id.
+ */
+const sessionTurnQueues = new Map<string, Promise<unknown>>();
+
+/**
+ * Session ids whose turn lock is already held by the current async context.
+ * Acquisition must be re-entrant: callers that own state persistence hold the
+ * lock across their whole load -> send -> save (see
+ * {@link withSessionStateTurn}), and the send path takes the same lock
+ * internally — a second non-re-entrant acquire would queue behind itself and
+ * wedge the conversation forever.
+ */
+const heldSessionLocks = new AsyncLocalStorage<ReadonlySet<string>>();
+
+/**
+ * Runs `fn` after any turn already queued for `sessionId`. Predecessor failures
+ * never poison the queue, and the map entry is dropped once the tail settles, so
+ * a failing agent run cannot deadlock the conversation.
+ */
+export function withSessionTurnLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+  const held = heldSessionLocks.getStore();
+  if (held?.has(sessionId)) return fn();
+  const owned = new Set(held || []).add(sessionId);
+  const previous = sessionTurnQueues.get(sessionId) || Promise.resolve();
+  const run = previous.then(() => heldSessionLocks.run(owned, fn));
+  const tail = run.then(() => undefined, () => undefined);
+  sessionTurnQueues.set(sessionId, tail);
+  void tail.then(() => {
+    if (sessionTurnQueues.get(sessionId) === tail) sessionTurnQueues.delete(sessionId);
+  });
+  return run;
+}
+
+/** Reads and writes the persisted bridge state a turn operates on. */
+export interface SessionStateStore {
+  load: () => Promise<BridgeState>;
+  save: (state: BridgeState) => Promise<void>;
+}
+
+/**
+ * Runs one turn as a single critical section: the state snapshot is both READ
+ * and WRITTEN inside the session turn lock.
+ *
+ * Callers that own persistence — the `bridge_session_send` /
+ * `bridge_session_route_message` MCP tools — must use this instead of
+ * load -> send -> save wrapped around the lock. Each tool invocation parses its
+ * own state object, so a turn that loaded before its predecessor ran would enter
+ * the lock holding a pre-predecessor snapshot: it would resume nothing, fork a
+ * SECOND codewith thread for the conversation, and its trailing save would
+ * clobber the thread id (plus the ledger entry, binding and offsets) the first
+ * turn recorded. Serialising the agent run alone does not prevent that.
+ *
+ * `sessionId` is undefined when the conversation has no binding yet: there is no
+ * session to serialise on, and the turn's own {@link sendBridgeSessionMessage}
+ * takes the lock once one exists.
+ */
+export async function withSessionStateTurn<T>(
+  sessionId: string | undefined,
+  store: SessionStateStore,
+  fn: (state: BridgeState) => Promise<T>,
+): Promise<T> {
+  const turn = async (): Promise<T> => {
+    const state = await store.load();
+    const result = await fn(state);
+    await store.save(state);
+    return result;
+  };
+  return sessionId ? withSessionTurnLock(sessionId, turn) : turn();
+}
+
+/**
+ * The session a message would be dispatched to, resolved from its conversation
+ * binding. Callers that own persistence need this key BEFORE they read state
+ * inside the lock, so the whole load -> dispatch -> save is one critical
+ * section; `undefined` means the conversation has no binding yet.
+ */
+export function messageSessionId(
+  config: BridgeConfig,
+  state: BridgeState,
+  message: BridgeMessage,
+): string | undefined {
+  return findBridgeBinding(config, state, message)?.activeSessionId;
+}
+
+export function sendBridgeSessionMessage(
   config: BridgeConfig,
   state: BridgeState,
   sessionId: string,
   message: BridgeMessage,
   options: SessionMessageOptions = {},
+): Promise<SessionMessageResult> {
+  // The session is read INSIDE the lock, so a queued turn sees the thread id and
+  // auth profile the preceding turn recorded — but only as far as `state` is the
+  // same object the preceding turn mutated. A caller that parses its own
+  // snapshot per invocation must take the lock around its load AND its save via
+  // {@link withSessionStateTurn}, or the queued turn still enters with a
+  // pre-predecessor view.
+  return withSessionTurnLock(sessionId, () => runBridgeSessionTurn(config, state, sessionId, message, options));
+}
+
+async function runBridgeSessionTurn(
+  config: BridgeConfig,
+  state: BridgeState,
+  sessionId: string,
+  message: BridgeMessage,
+  options: SessionMessageOptions,
 ): Promise<SessionMessageResult> {
   const session = getBridgeSession(state, sessionId);
   if (session.status === "paused") return { kind: "session", session, status: "paused", message: "Session is paused" };
@@ -389,7 +499,12 @@ export async function sendBridgeSessionMessage(
   const timestamp = nowIso();
   session.lastMessageAt = timestamp;
   session.updatedAt = timestamp;
-  if (session.agentSession) session.agentSession.updatedAt = timestamp;
+  const ref = session.agentSession;
+  if (ref) ref.updatedAt = timestamp;
+  // An EARLIER turn dropped a provably gone thread and could not tell the user
+  // (it failed, so it produced no reply to carry the notice). Read the debt
+  // before recordDurableSession, which is what may raise it on THIS turn.
+  const resetDebt = Boolean(ref?.contextResetPending);
   // Persist any durable provider session id even on failure, so the next
   // message resumes the same codewith session rather than starting over.
   recordDurableSession(session, agent);
@@ -407,7 +522,13 @@ export async function sendBridgeSessionMessage(
     };
   }
 
+  // This turn succeeded, so it is the first one able to deliver the notice.
+  if (resetDebt) agent.contextReset = true;
   const responseText = agentReplyText(agent);
+  // Settle the debt only once a reply actually carries the note. The note is
+  // baked into `responseText`, which the ledger stores and re-delivers, so a
+  // failed send still surfaces it on redelivery rather than losing it.
+  if (responseText && ref?.contextResetPending) delete ref.contextResetPending;
   await options.beforeDeliver?.(agent, responseText);
   const deliveredResponse = responseText ? await deliverResponse(config, message, responseText, options) : false;
   return {

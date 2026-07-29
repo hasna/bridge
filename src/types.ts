@@ -228,7 +228,19 @@ export interface MessageLedgerEntry {
   conversationId?: string;
   sessionId?: string;
   status: LedgerStatus;
+  /**
+   * Attempts at *processing* the message (running the agent). Counted by the
+   * message ledger on every dispatch.
+   */
   attempts: number;
+  /**
+   * Attempts at *delivering* a reply the agent already produced successfully.
+   * Tracked separately from {@link attempts} because the two are different
+   * failure domains: a transport outage while sending an answer that already
+   * exists must not consume the processing budget, and must never be reported to
+   * the user as a failure to process their message.
+   */
+  deliveryAttempts?: number;
   firstSeenAt: string;
   updatedAt: string;
   terminalAt?: string;

@@ -8,6 +8,7 @@ import {
   createBridgeSession,
   dispatchMessageWithSessions,
   getIMessageMessages,
+  getIMessageMessagePage,
   imessageHandleAllowed,
   imessageRowToMessage,
   loadConfig,
@@ -273,4 +274,83 @@ test("disallowed iMessage handles do not invoke agents through session or route 
   expect(sessionResult.session?.status).toBe("unauthorized");
   expect(routeResult).toEqual([]);
   expect(runs).toBe(0);
+});
+
+/**
+ * Builds a fixture chat.db and returns its path. `handles` lists the sender of
+ * each message in ROWID order, starting at ROWID 1.
+ */
+async function fixtureChatDb(handles: string[]): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-imessage-window-"));
+  const path = join(dir, "chat.db");
+  const db = new Database(path);
+  db.run("create table handle (ROWID integer primary key, id text)");
+  db.run("create table message (ROWID integer primary key, handle_id integer, text text, date integer, is_from_me integer)");
+  db.run("create table chat (ROWID integer primary key, guid text, display_name text)");
+  db.run("create table chat_message_join (chat_id integer, message_id integer)");
+  const unique = [...new Set(handles)];
+  for (const [index, id] of unique.entries()) db.run("insert into handle (ROWID, id) values (?, ?)", [index + 1, id]);
+  db.run("insert into chat (ROWID, guid, display_name) values (1, 'iMessage;-;group-guid', 'Group')");
+  for (const [index, id] of handles.entries()) {
+    const rowId = index + 1;
+    db.run("insert into message (ROWID, handle_id, text, date, is_from_me) values (?, ?, ?, 0, 0)", [
+      rowId, unique.indexOf(id) + 1, `msg-${rowId}`,
+    ]);
+    db.run("insert into chat_message_join (chat_id, message_id) values (1, ?)", [rowId]);
+  }
+  db.close();
+  return path;
+}
+
+test("a scan window of only disallowed rows still advances the cursor", async () => {
+  // 30 messages from a blocked handle, then one from the allowed handle. With
+  // pollLimit 2 the scan window is 20 rows, so the first poll sees nothing it
+  // may deliver. Reporting no progress leaves the cursor at 0 forever and the
+  // allowed message is never delivered — the channel goes permanently deaf.
+  const blocked = Array.from({ length: 30 }, () => "+15555550199");
+  const path = await fixtureChatDb([...blocked, "+15555550100"]);
+  const pollChannel: IMessageChannelConfig = {
+    ...channel, receiveMode: "chat-db", chatDbPath: path, pollLimit: 2,
+  };
+
+  let cursor = 0;
+  let delivered: string[] = [];
+  for (let poll = 0; poll < 10 && !delivered.length; poll++) {
+    const page = getIMessageMessagePage(pollChannel, { afterRowId: cursor });
+    delivered = page.rows.map((row) => row.text);
+    expect(page.scannedThroughRowId).toBeGreaterThan(cursor);
+    cursor = page.scannedThroughRowId ?? cursor;
+  }
+
+  expect(delivered).toEqual(["msg-31"]);
+});
+
+test("a truncated page never reports progress past the rows it returned", async () => {
+  // Five allowed messages but pollLimit 2: the cursor must stop at the last
+  // returned row, or the three undelivered ones are silently skipped.
+  const path = await fixtureChatDb(Array.from({ length: 5 }, () => "+15555550100"));
+  const pollChannel: IMessageChannelConfig = {
+    ...channel, receiveMode: "chat-db", chatDbPath: path, pollLimit: 2,
+  };
+
+  const seen: string[] = [];
+  let cursor = 0;
+  for (let poll = 0; poll < 5; poll++) {
+    const page = getIMessageMessagePage(pollChannel, { afterRowId: cursor });
+    if (!page.rows.length && page.scannedThroughRowId === undefined) break;
+    seen.push(...page.rows.map((row) => row.text));
+    cursor = page.scannedThroughRowId ?? cursor;
+  }
+
+  expect(seen).toEqual(["msg-1", "msg-2", "msg-3", "msg-4", "msg-5"]);
+});
+
+test("an empty scan window reports no progress", async () => {
+  const path = await fixtureChatDb(["+15555550100"]);
+  const pollChannel: IMessageChannelConfig = {
+    ...channel, receiveMode: "chat-db", chatDbPath: path,
+  };
+  const page = getIMessageMessagePage(pollChannel, { afterRowId: 99 });
+  expect(page.rows).toEqual([]);
+  expect(page.scannedThroughRowId).toBeUndefined();
 });

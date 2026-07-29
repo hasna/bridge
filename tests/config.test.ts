@@ -108,3 +108,89 @@ test("doctor fails existing weak state permissions", async () => {
   expect(report.ok).toBe(false);
   expect(report.checks.find((check) => check.name === "state")?.ok).toBe(false);
 });
+
+test("rejects a route textRegex that is not a valid regular expression", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-config-"));
+  const path = join(dir, "config.json");
+  await ensureConfig(path);
+
+  // Previously accepted, then thrown as a raw SyntaxError from inside
+  // matchingRoutes on every inbound message — which wedges the poll loop
+  // because the offset can never advance past the failing message.
+  const rejected = await upsertRoute(
+    { id: "bad", fromChannel: "tg", toAgent: "echo", enabled: true, match: { textRegex: "[[" } },
+    path,
+  ).catch((err) => err);
+  expect(rejected).toBeInstanceOf(Error);
+  expect(String(rejected.message)).toContain("textRegex");
+
+  const config = await loadConfig(path);
+  expect(config.routes).toHaveLength(0);
+
+  await upsertRoute(
+    { id: "good", fromChannel: "tg", toAgent: "echo", enabled: true, match: { textRegex: "^hi\\b" } },
+    path,
+  );
+  expect((await loadConfig(path)).routes).toHaveLength(1);
+});
+
+test("routes add surfaces an invalid regex as a clean CLI error", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-config-"));
+  const path = join(dir, "config.json");
+  await ensureConfig(path);
+
+  const proc = Bun.spawn([
+    "bun", "run", "src/cli/index.ts",
+    "routes", "add", "bad", "--from", "tg", "--to", "echo", "--text-regex", "[[", "--config", path,
+  ], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
+  const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+
+  expect(exitCode).toBe(1);
+  expect(stderr).toContain("textRegex");
+  expect(stderr).not.toContain("at <anonymous>");
+  expect((await loadConfig(path)).routes).toHaveLength(0);
+});
+
+test("rejects a config whose record key does not match the entry id", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-config-"));
+  const path = join(dir, "config.json");
+
+  // A hand-edited key/id mismatch used to load fine and then misbehave
+  // silently: session bindings are keyed by channel.id while inbound lookups use
+  // the record key, so `sessions attach` created a binding no message ever
+  // matched and every message got the "no session attached" reply.
+  await Bun.write(path, JSON.stringify({
+    version: 1,
+    channels: { "tg-old": { id: "tg", kind: "telegram", enabled: true, allowedChatIds: ["1"] } },
+    profiles: {},
+    agents: {},
+    routes: [],
+  }));
+
+  const err = await loadConfig(path).catch((e) => e);
+  expect(err).toBeInstanceOf(Error);
+  expect(String(err.message)).toContain("tg-old");
+
+  await Bun.write(path, JSON.stringify({
+    version: 1,
+    channels: {},
+    profiles: {},
+    agents: { "a-old": { id: "a", kind: "shell" } },
+    routes: [],
+  }));
+  const agentErr = await loadConfig(path).catch((e) => e);
+  expect(agentErr).toBeInstanceOf(Error);
+  expect(String(agentErr.message)).toContain("a-old");
+});
+
+test("a matching key and id still loads", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-config-"));
+  const path = join(dir, "config.json");
+  await upsertChannel({ id: "tg", kind: "telegram", enabled: true, allowedChatIds: ["1"] }, path);
+  await upsertAgent({ id: "a", kind: "shell" }, path);
+  await upsertProfile({ id: "p", agentKind: "shell" }, path);
+  const config = await loadConfig(path);
+  expect(Object.keys(config.channels)).toEqual(["tg"]);
+  expect(Object.keys(config.agents)).toEqual(["a"]);
+  expect(Object.keys(config.profiles)).toEqual(["p"]);
+});

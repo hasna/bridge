@@ -187,6 +187,17 @@ export interface AgentSessionRef {
    * {@link refId} (the thread) is unchanged, so context carries across the switch.
    */
   authProfile?: string;
+  /**
+   * Set when a turn dropped a provably gone {@link refId} without establishing a
+   * replacement thread, so the conversation's earlier context is lost but the
+   * user has not been told yet (the turn that discovered it failed, and produced
+   * no reply to carry the notice). The next turn that actually reaches the user
+   * shows the context-reset note once and clears this.
+   *
+   * Persisted with the rest of the ref because the loss must survive a daemon
+   * restart between the failed turn and the next one.
+   */
+  contextResetPending?: boolean;
   createdAt?: string;
   updatedAt?: string;
   detail?: string;

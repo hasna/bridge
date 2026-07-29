@@ -430,7 +430,12 @@ async function runBridgeSessionTurn(
   const timestamp = nowIso();
   session.lastMessageAt = timestamp;
   session.updatedAt = timestamp;
-  if (session.agentSession) session.agentSession.updatedAt = timestamp;
+  const ref = session.agentSession;
+  if (ref) ref.updatedAt = timestamp;
+  // An EARLIER turn dropped a provably gone thread and could not tell the user
+  // (it failed, so it produced no reply to carry the notice). Read the debt
+  // before recordDurableSession, which is what may raise it on THIS turn.
+  const resetDebt = Boolean(ref?.contextResetPending);
   // Persist any durable provider session id even on failure, so the next
   // message resumes the same codewith session rather than starting over.
   recordDurableSession(session, agent);
@@ -448,7 +453,13 @@ async function runBridgeSessionTurn(
     };
   }
 
+  // This turn succeeded, so it is the first one able to deliver the notice.
+  if (resetDebt) agent.contextReset = true;
   const responseText = agentReplyText(agent);
+  // Settle the debt only once a reply actually carries the note. The note is
+  // baked into `responseText`, which the ledger stores and re-delivers, so a
+  // failed send still surfaces it on redelivery rather than losing it.
+  if (responseText && ref?.contextResetPending) delete ref.contextResetPending;
   await options.beforeDeliver?.(agent, responseText);
   const deliveredResponse = responseText ? await deliverResponse(config, message, responseText, options) : false;
   return {

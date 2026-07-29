@@ -627,9 +627,12 @@ function createBoundedCapture(limit: number): BoundedCapture {
       }
     },
     text() {
+      // Decode head+tail as ONE buffer when nothing was dropped: they are a
+      // contiguous stream, and decoding them separately mangles any multi-byte
+      // UTF-8 character that happens to straddle the internal seam.
+      if (!dropped) return Buffer.concat([...head, ...tail]).toString("utf-8");
       const headText = Buffer.concat(head).toString("utf-8");
       const tailText = Buffer.concat(tail).toString("utf-8");
-      if (!dropped) return headText + tailText;
       return `${headText}\n… ${dropped} bytes of agent output omitted …\n${tailText}`;
     },
   };
@@ -683,27 +686,80 @@ function killAgentTree(child: ChildProcess, signal: NodeJS.Signals): void {
   }
 }
 
-/** Agent process groups still running, killed if the station process exits. */
+/**
+ * Releases our end of the child's pipes when `close` never fired. Something
+ * outside our reach still holds the write end, so the ChildProcess stdio handles
+ * stay referenced by the event loop and the HOST process can never exit: a
+ * one-shot `bridge send` would print its result and then hang forever, and
+ * `serve` could never terminate normally (which would also stop the exit-time
+ * agent reaper from ever running).
+ */
+function releaseChildStreams(child: ChildProcess): void {
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+  child.unref();
+}
+
+/** Process-group leaders of agent runs currently in flight. */
 const liveAgentPids = new Set<number>();
-let exitHookInstalled = false;
+let reaperInstalled = false;
+
+/** Signals the process group of every in-flight agent run. Synchronous. */
+function reapLiveAgents(signal: NodeJS.Signals): void {
+  for (const pid of liveAgentPids) {
+    try {
+      process.kill(-pid, signal);
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
+const REAPED_SIGNALS: NodeJS.Signals[] = ["SIGTERM", "SIGINT"];
 
 /**
- * `detached: true` means an agent survives its parent by default. Reap any
- * still-running agent when the station process exits normally, so a graceful
- * daemon stop does not leave a codewith run behind.
+ * Restores the station's handle on its agents, which `detached: true` otherwise
+ * removes.
+ *
+ * Before `detached`, agents shared the station's process group, so the group
+ * signal `bridge daemon stop` sends (`daemon.ts` -> `process.kill(-pid, ...)`)
+ * reaped the in-flight agent on BOTH the graceful and the forced path. `detached`
+ * is what makes the run timeout able to kill an agent's whole tree, but it also
+ * opts agents out of that group signal — so this module has to reap them itself.
+ *
+ * Three things follow, and the handlers below cover all three:
+ *  - The signal is forwarded to the agent groups, so an in-flight run is
+ *    actually shortened by a stop instead of running out its own (default 120s)
+ *    budget while the daemon only waits 5s and then reports a failed stop.
+ *  - `on` (not `once`), so a SECOND SIGTERM — systemd's shutdown escalation —
+ *    is still handled rather than silently skipped.
+ *  - Merely adding a signal listener suppresses Node's default termination, so
+ *    when nothing else is listening the handler re-raises the signal to restore
+ *    it. Otherwise a one-shot `bridge send` would stop dying on Ctrl-C.
+ *
+ * NOTE: this cannot help when the station itself is SIGKILLed, which no handler
+ * can intercept; a `--force` stop is still preceded by a SIGTERM, which is
+ * handled here.
  */
-function ensureExitHook(): void {
-  if (exitHookInstalled) return;
-  exitHookInstalled = true;
-  process.on("exit", () => {
-    for (const pid of liveAgentPids) {
-      try {
-        process.kill(-pid, "SIGTERM");
-      } catch {
-        // Already gone.
+function ensureAgentReaperInstalled(): void {
+  if (reaperInstalled) return;
+  reaperInstalled = true;
+
+  // Last resort: the station is gone, so nothing is left to supervise or time
+  // out an in-flight agent. Kill hard rather than leave an authenticated
+  // approvals-bypassed run with no parent.
+  process.on("exit", () => reapLiveAgents("SIGKILL"));
+
+  for (const signal of REAPED_SIGNALS) {
+    const handler = (): void => {
+      reapLiveAgents(signal);
+      if (process.listenerCount(signal) <= 1) {
+        process.removeListener(signal, handler);
+        process.kill(process.pid, signal);
       }
-    }
-  });
+    };
+    process.on(signal, handler);
+  }
 }
 
 /**
@@ -722,7 +778,7 @@ export async function spawnAgentProcess(command: string[], options: SpawnAgentOp
   const graceMs = options.killGraceMs ?? AGENT_KILL_GRACE_MS;
   const limit = options.maxOutputBytes ?? AGENT_MAX_OUTPUT_BYTES;
 
-  ensureExitHook();
+  ensureAgentReaperInstalled();
   const child = spawnChildProcess(file, args, {
     cwd: options.cwd,
     env: options.env,
@@ -742,6 +798,7 @@ export async function spawnAgentProcess(command: string[], options: SpawnAgentOp
   child.stderr?.on("error", () => undefined);
 
   let exitCode: number | null = null;
+  let exited = false;
   let spawnError: Error | undefined;
   // `close` fires once the process has exited AND its pipes are drained/closed.
   const closed = new Promise<void>((resolve) => {
@@ -750,6 +807,7 @@ export async function spawnAgentProcess(command: string[], options: SpawnAgentOp
       resolve();
     });
     child.once("exit", (code, signal) => {
+      exited = true;
       exitCode = code ?? signalExitCode(signal);
     });
     child.once("close", () => resolve());
@@ -762,15 +820,34 @@ export async function spawnAgentProcess(command: string[], options: SpawnAgentOp
       return { exitCode, stdout: stdout.text(), stderr: stderr.text(), timedOut: false };
     }
 
+    // The timeout window elapsed without `close` — which does NOT mean the agent
+    // hung. `close` also waits for the pipes to drain, and anything the agent
+    // left behind (a dev server, a watcher, `bun run dev &`) inherits stdout and
+    // holds them open. Read the exit flag BEFORE signalling anything: if the
+    // agent itself already exited, the run COMPLETED, and reporting a timeout
+    // would throw away a correct answer, mark the turn `failed`, and — because
+    // `failed` is not a terminal ledger status — re-run the whole turn up to
+    // DEFAULT_MAX_ATTEMPTS times, appending duplicate turns to the same codewith
+    // thread before finally telling the user it could not be processed.
+    const exitedBeforeKill = exited;
+    if (exitedBeforeKill) {
+      releaseChildStreams(child);
+      if (spawnError) throw spawnError;
+      // Leave the survivors alone: the agent finished, and killing its group now
+      // would take down exactly the background process it was asked to start.
+      return { exitCode, stdout: stdout.text(), stderr: stderr.text(), timedOut: false };
+    }
+
     killAgentTree(child, "SIGTERM");
     if (!(await settledWithin(closed, graceMs))) {
       killAgentTree(child, "SIGKILL");
-      // Bounded on purpose: if something outside the group still holds a pipe,
-      // return the output captured so far rather than blocking the bridge.
-      await settledWithin(closed, graceMs);
+      // Bounded on purpose: a process that escaped the group (anything calling
+      // setsid or double-forking — docker, tmux, a daemonising tool) survives
+      // the group kill and can hold the pipe open indefinitely.
+      if (!(await settledWithin(closed, graceMs))) releaseChildStreams(child);
     }
     if (spawnError) throw spawnError;
-    // A timed-out run reports no exit code; callers gate on `timedOut`.
+    // A genuinely timed-out run reports no exit code; callers gate on `timedOut`.
     return { exitCode: null, stdout: stdout.text(), stderr: stderr.text(), timedOut: true };
   } finally {
     if (child.pid !== undefined) liveAgentPids.delete(child.pid);
@@ -1184,6 +1261,11 @@ export function recordDurableSession(session: BridgeSession, agent: AgentRunResu
   if (!agent.providerSessionId) {
     if (agent.staleSessionHealed && ref.refId !== undefined) {
       delete ref.refId;
+      // Dropping the pointer is what stops the pointless resume-retry loop, but
+      // it also means the NEXT turn just starts a fresh thread with nothing to
+      // heal — so nothing would flag the loss and the user would silently lose
+      // their conversation. Carry the debt forward until it has been reported.
+      ref.contextResetPending = true;
       ref.updatedAt = new Date().toISOString();
       return true;
     }

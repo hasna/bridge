@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultAgentSpawn, spawnAgentProcess } from "../src/index.js";
@@ -117,4 +117,121 @@ test("spawning a missing binary rejects instead of returning a fake successful r
   await expect(
     spawnAgentProcess(["bridge-definitely-not-a-real-binary-xyz"], { timeoutMs: 5_000 }),
   ).rejects.toThrow();
+}, 20_000);
+
+/**
+ * Regression: a COMPLETED run must not be reported as a timeout.
+ *
+ * `close` needs the process to exit AND its pipes to drain, and anything the
+ * agent leaves behind (`bun run dev &`, a watcher) inherits stdout and holds
+ * them open. The first version of this fix hardcoded `timedOut: true` on the
+ * give-up path, discarding the exit code the `exit` handler had already
+ * captured. Downstream that becomes status `failed`, which is NOT a terminal
+ * ledger status, so one user message was re-run up to DEFAULT_MAX_ATTEMPTS
+ * times — five real agent runs appending five duplicate turns to the same
+ * codewith thread — before the user got their correct answer wrapped in
+ * "⚠️ I could not process that message (5 attempts)".
+ */
+test("a finished run is not reported as a timeout just because a leftover process holds the pipe", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-spawn-"));
+  const pidFile = join(dir, "holder.pid");
+  let holder = 0;
+  try {
+    const result = await spawnAgentProcess(
+      ["sh", "-lc", `sleep 20 & echo $! > ${pidFile}; echo "the answer"; exit 0`],
+      { timeoutMs: 400, killGraceMs: 300 },
+    );
+
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("the answer");
+
+    // The run succeeded, so its leftover background process is left alone —
+    // killing the group here would take down exactly the dev server or watcher
+    // the agent was asked to start.
+    holder = Number.parseInt((await readFile(pidFile, "utf-8")).trim(), 10);
+    expect(pidAlive(holder)).toBe(true);
+  } finally {
+    if (holder) {
+      try {
+        process.kill(holder, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+}, 20_000);
+
+/**
+ * Regression: the HOST process must still be able to exit.
+ *
+ * On any path where `close` never fires, the ChildProcess stdio handles stay
+ * referenced by the event loop, so the host hangs forever even after
+ * `spawnAgentProcess` has correctly returned. A one-shot `bridge send` printed
+ * its result and then blocked indefinitely — fatal for a scripted or CI caller —
+ * and `serve` could never terminate normally, which also meant the exit-time
+ * agent reaper could never run.
+ */
+test("the host process exits naturally after a run whose pipes are still held open", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-hostexit-"));
+  const holderPidFile = join(dir, "holder.pid");
+  let holder = 0;
+  try {
+    const indexPath = join(import.meta.dir, "..", "src", "index.ts");
+    const scriptPath = join(dir, "host.ts");
+    // The pipe holder must outlive the whole measurement window: without the
+    // stream release the host hangs until the holder exits, so a short-lived
+    // holder would let a broken build pass by exiting first.
+    await writeFile(
+      scriptPath,
+      [
+        `import { spawnAgentProcess } from ${JSON.stringify(indexPath)};`,
+        `const r = await spawnAgentProcess(["sh", "-lc", ${JSON.stringify(`sleep 20 & echo $! > ${holderPidFile}; echo done`)}], { timeoutMs: 400, killGraceMs: 300 });`,
+        `console.log("RESULT", r.timedOut, r.stdout.trim());`,
+      ].join("\n"),
+    );
+
+    const host = Bun.spawn(["bun", "run", scriptPath], { stdout: "pipe", stderr: "pipe" });
+    const exitCode = await Promise.race([
+      host.exited,
+      new Promise<"HUNG">((resolve) => setTimeout(() => resolve("HUNG"), 12_000)),
+    ]);
+    const stdout = await new Response(host.stdout).text();
+    if (exitCode === "HUNG") host.kill(9);
+
+    expect(stdout).toContain("RESULT");
+    expect(exitCode).toBe(0);
+
+    holder = Number.parseInt((await readFile(holderPidFile, "utf-8")).trim(), 10);
+  } finally {
+    if (holder) {
+      try {
+        process.kill(holder, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+}, 30_000);
+
+/**
+ * Regression: head and tail were decoded as separate buffers, so a multi-byte
+ * UTF-8 character straddling the internal seam was corrupted into replacement
+ * characters even when NOTHING was dropped.
+ */
+test("a multi-byte character straddling the capture seam is not corrupted", async () => {
+  // 9 ASCII bytes, then é as its two raw bytes (0xC3 0xA9), then X: 12 bytes
+  // total. With a 20-byte cap the seam falls at byte 10 — mid-character — and
+  // nothing is dropped.
+  const result = await spawnAgentProcess(
+    ["sh", "-lc", "printf 'aaaaaaaaa\\303\\251X'"],
+    { timeoutMs: 10_000, maxOutputBytes: 20 },
+  );
+
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout).toBe("aaaaaaaaaéX");
+  expect(result.stdout).not.toContain("�");
+  expect(result.stdout).not.toContain("omitted");
 }, 20_000);

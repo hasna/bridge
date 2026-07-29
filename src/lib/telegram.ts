@@ -118,41 +118,66 @@ export class TelegramApiError extends Error {
   }
 }
 
-const REDACTED_TOKEN = "[redacted-token]";
+const REDACTED_SECRET = "[redacted-secret]";
 
 /**
- * Any `/bot<id>:<secret>` path segment, whatever token it holds.
+ * The secret half of any `/bot<id>:<secret>` path segment, whatever bot it
+ * belongs to. Group 1 captures `/bot<id>:` so the id is preserved.
  *
  * The structural pass is what makes redaction robust: matching only the token we
  * were handed misses a proxy echoing a redirect, another bot's path, or a
  * percent-encoded form. `%` and `.` are in the class so a percent-escaped or
  * dot-bearing secret is consumed whole rather than half-redacted.
  */
-const BOT_TOKEN_PATH = /\/bot\d{5,}(?::|%3A|%3a)[A-Za-z0-9_%.-]{20,}/g;
+const BOT_TOKEN_PATH = /(\/bot\d{5,}(?::|%3A|%3a))[A-Za-z0-9_%.-]{20,}/g;
 
 /**
- * Strip the bot token from any text borrowed from another error or an upstream
- * response, by value AND by shape.
+ * The credential-bearing half of `<bot_id>:<secret>`.
+ *
+ * Only the part after the colon is secret: `<bot_id>` is the bot's public user
+ * id — returned by getMe and derivable by anyone who can message the bot — so it
+ * is deliberately preserved. Redacting it would buy no protection while costing a
+ * self-hosted telegram-bot-api operator the single most useful field for
+ * diagnosing a routing problem. A value with no colon is malformed, so the whole
+ * of it is treated as secret.
+ */
+function tokenSecret(token: string): string {
+  const colon = token.indexOf(":");
+  return colon === -1 ? token : token.slice(colon + 1);
+}
+
+/**
+ * Strip the bot token's secret from any text borrowed from another error or an
+ * upstream response, by value AND by shape.
  *
  * The value pass alone is not enough. WHATWG URL parsing strips `\n`, `\r` and
  * `\t`, so a token read with `export TOKEN=$(cat tokenfile)` (trailing newline)
  * goes on the wire CLEAN while an exact-substring search for the padded value
- * matches nothing. Hence: the raw value, its trimmed form, and its
- * percent-encoded forms, then the structural sweep as the backstop.
+ * matches nothing. Hence both the raw and trimmed token are split, and each
+ * yields its secret plus that secret's percent-encoded form, with the structural
+ * sweep as the backstop.
+ *
+ * The value pass runs on the secret rather than the whole token so both passes
+ * agree: whichever one fires, the bot id survives and only the secret goes.
  */
 function redactToken(text: string, token: string): string {
   let out = text;
   const variants = new Set<string>();
   for (const candidate of [token, token.trim()]) {
     if (!candidate) continue;
-    variants.add(candidate);
-    variants.add(encodeURIComponent(candidate));
+    const secret = tokenSecret(candidate);
+    if (!secret) continue;
+    variants.add(secret);
+    variants.add(encodeURIComponent(secret));
   }
-  // Longest first, so a shorter variant cannot leave a fragment of a longer one.
+  // Longest first. With today's variants (one secret, differing only by padding
+  // and percent-encoding) order cannot change the outcome — no mutation test
+  // fails without this sort. It is kept so that adding a variant which is a
+  // substring of another cannot silently start leaving a fragment behind.
   for (const variant of [...variants].sort((a, b) => b.length - a.length)) {
-    out = out.split(variant).join(REDACTED_TOKEN);
+    out = out.split(variant).join(REDACTED_SECRET);
   }
-  return out.replace(BOT_TOKEN_PATH, `/bot${REDACTED_TOKEN}`);
+  return out.replace(BOT_TOKEN_PATH, `$1${REDACTED_SECRET}`);
 }
 
 interface TelegramResponseBody {

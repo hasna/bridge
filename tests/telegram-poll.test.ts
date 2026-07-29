@@ -258,7 +258,79 @@ test("a bare token echoed without the /bot prefix is redacted even when padded",
     const surface = errorSurface(err);
     expect(surface).not.toContain(TOKEN);
     expect(surface).not.toContain("SUPER-SECRET");
-    expect((err as TelegramApiError).description).toContain("[redacted-token]");
+    expect((err as TelegramApiError).description).toContain("[redacted-secret]");
+  } finally {
+    server.stop(true);
+  }
+});
+
+test("the public bot id survives redaction while the secret half does not", async () => {
+  // `<bot_id>:<secret>` — the id before the colon is the bot's public user id
+  // (returned by getMe, visible to anyone who can message the bot), so it is not
+  // a credential. Preserving it keeps the most useful field for diagnosing a
+  // self-hosted telegram-bot-api routing problem at no cost to protection.
+  // This test exists so a later "simplification" of the regex cannot silently
+  // re-broaden redaction back over the id.
+  const other = "987654:ANOTHER-BOTS-SECRET-TOKEN-X";
+  const server = Bun.serve({
+    port: 0,
+    fetch: (request) => Response.json(
+      {
+        ok: false,
+        error_code: 404,
+        description: `route failed: /bot${other}/getUpdates then ${new URL(request.url).pathname}`,
+      },
+      { status: 404 },
+    ),
+  });
+  process.env["BRIDGE_TELEGRAM_API_BASE"] = `http://127.0.0.1:${server.port}`;
+  try {
+    const err = await getTelegramUpdates(TOKEN, { timeoutSeconds: 1 }).catch((e) => e);
+    const description = (err as TelegramApiError).description ?? "";
+
+    // Both bot ids survive — ours, and the neighbouring one the proxy echoed.
+    expect(description).toContain("/bot111222:");
+    expect(description).toContain("/bot987654:");
+    expect(description).toContain("[redacted-secret]");
+
+    // Neither secret does.
+    expect(description).not.toContain("SUPER-SECRET");
+    expect(description).not.toContain("ANOTHER-BOTS-SECRET");
+    expect(errorSurface(err)).not.toContain(TOKEN);
+    expect(errorSurface(err)).not.toContain(other);
+  } finally {
+    server.stop(true);
+  }
+});
+
+test("a self-hosted token whose secret contains URL metacharacters is fully redacted", async () => {
+  // BRIDGE_TELEGRAM_API_BASE supports a self-hosted telegram-bot-api, so the
+  // secret must not be assumed to use Telegram's own [A-Za-z0-9_-] charset.
+  // A secret containing `+` and `/` defeats the structural sweep twice over: the
+  // character class excludes `/`, and `+` cuts the run below the {20,} floor. The
+  // value pass is the only defence, and it needs the percent-encoded form for a
+  // proxy that echoes an encoded path.
+  const selfHosted = "555777:selfhosted+secret/value-0123456789";
+  const secret = "selfhosted+secret/value-0123456789";
+  const server = Bun.serve({
+    port: 0,
+    fetch(request) {
+      const pathname = new URL(request.url).pathname;
+      return Response.json(
+        { ok: false, error_code: 404, description: `Cannot GET ${pathname} (encoded ${encodeURIComponent(pathname)})` },
+        { status: 404 },
+      );
+    },
+  });
+  process.env["BRIDGE_TELEGRAM_API_BASE"] = `http://127.0.0.1:${server.port}`;
+  try {
+    const err = await getTelegramUpdates(selfHosted, { timeoutSeconds: 1 }).catch((e) => e);
+    const surface = errorSurface(err);
+    expect(surface).not.toContain(secret);
+    expect(surface).not.toContain(encodeURIComponent(secret));
+    // No surviving fragment of either form.
+    expect(surface).not.toContain("selfhosted");
+    expect(surface).not.toContain("value-0123456789");
   } finally {
     server.stop(true);
   }

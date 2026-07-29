@@ -118,11 +118,36 @@ const routeSchema = z.object({
   }).optional(),
 });
 
+/**
+ * Record keys must equal the entry's own `id`.
+ *
+ * Lookups are split between the two: inbound routing reads
+ * `config.channels[message.channelId]` (the key) while session bindings are
+ * keyed by `channel.id`. A mismatch loaded silently and then misbehaved —
+ * `sessions attach` produced a binding no inbound message ever matched, so every
+ * message got the "no session attached" reply. The CLI writers always key by id,
+ * so this only guards hand-edited files, and failing loudly beats misrouting.
+ */
+function requireKeyMatchesId<T extends { id: string }>(
+  label: string,
+): (items: Record<string, T>, ctx: z.RefinementCtx) => void {
+  return (items, ctx) => {
+    for (const [key, item] of Object.entries(items)) {
+      if (item.id === key) continue;
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [key],
+        message: `${label} key "${key}" does not match its id "${item.id}"`,
+      });
+    }
+  };
+}
+
 const configSchema = z.object({
   version: z.literal(CONFIG_VERSION),
-  channels: z.record(channelSchema),
-  profiles: z.record(profileSchema),
-  agents: z.record(agentSchema),
+  channels: z.record(channelSchema).superRefine(requireKeyMatchesId("channels")),
+  profiles: z.record(profileSchema).superRefine(requireKeyMatchesId("profiles")),
+  agents: z.record(agentSchema).superRefine(requireKeyMatchesId("agents")),
   routes: z.array(routeSchema),
 });
 

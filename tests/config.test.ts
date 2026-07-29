@@ -150,3 +150,47 @@ test("routes add surfaces an invalid regex as a clean CLI error", async () => {
   expect(stderr).not.toContain("at <anonymous>");
   expect((await loadConfig(path)).routes).toHaveLength(0);
 });
+
+test("rejects a config whose record key does not match the entry id", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-config-"));
+  const path = join(dir, "config.json");
+
+  // A hand-edited key/id mismatch used to load fine and then misbehave
+  // silently: session bindings are keyed by channel.id while inbound lookups use
+  // the record key, so `sessions attach` created a binding no message ever
+  // matched and every message got the "no session attached" reply.
+  await Bun.write(path, JSON.stringify({
+    version: 1,
+    channels: { "tg-old": { id: "tg", kind: "telegram", enabled: true, allowedChatIds: ["1"] } },
+    profiles: {},
+    agents: {},
+    routes: [],
+  }));
+
+  const err = await loadConfig(path).catch((e) => e);
+  expect(err).toBeInstanceOf(Error);
+  expect(String(err.message)).toContain("tg-old");
+
+  await Bun.write(path, JSON.stringify({
+    version: 1,
+    channels: {},
+    profiles: {},
+    agents: { "a-old": { id: "a", kind: "shell" } },
+    routes: [],
+  }));
+  const agentErr = await loadConfig(path).catch((e) => e);
+  expect(agentErr).toBeInstanceOf(Error);
+  expect(String(agentErr.message)).toContain("a-old");
+});
+
+test("a matching key and id still loads", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-config-"));
+  const path = join(dir, "config.json");
+  await upsertChannel({ id: "tg", kind: "telegram", enabled: true, allowedChatIds: ["1"] }, path);
+  await upsertAgent({ id: "a", kind: "shell" }, path);
+  await upsertProfile({ id: "p", agentKind: "shell" }, path);
+  const config = await loadConfig(path);
+  expect(Object.keys(config.channels)).toEqual(["tg"]);
+  expect(Object.keys(config.agents)).toEqual(["a"]);
+  expect(Object.keys(config.profiles)).toEqual(["p"]);
+});

@@ -76,30 +76,133 @@ export function telegramBroadcastAllowed(channel: TelegramChannelConfig, chatId:
   return Boolean(chatId && channel.broadcastChatIds.includes(chatId));
 }
 
+export interface TelegramApiErrorInit {
+  method: string;
+  status?: number;
+  description?: string;
+  /** Seconds Telegram asked us to wait before retrying (429 `parameters.retry_after`). */
+  retryAfterSeconds?: number;
+  /** True when the request was cancelled through the caller's AbortSignal. */
+  aborted?: boolean;
+}
+
+/**
+ * Every failure raised out of this module, deliberately sanitised.
+ *
+ * The bot token is embedded in the Telegram request URL, and the runtime's own
+ * network errors carry that URL (Bun exposes it as `err.path`). Letting a raw
+ * error escape therefore prints the bot token to the terminal and to the daemon
+ * stderr log. Nothing here ever stores or re-exposes the URL, and any text taken
+ * from an underlying error has the token stripped out first.
+ */
+export class TelegramApiError extends Error {
+  readonly method: string;
+  readonly status: number | undefined;
+  readonly description: string | undefined;
+  readonly retryAfterSeconds: number | undefined;
+  readonly aborted: boolean;
+
+  constructor(message: string, init: TelegramApiErrorInit) {
+    super(message);
+    this.name = "TelegramApiError";
+    this.method = init.method;
+    this.status = init.status;
+    this.description = init.description;
+    this.retryAfterSeconds = init.retryAfterSeconds;
+    this.aborted = init.aborted ?? false;
+  }
+}
+
+/** Defence in depth: strip the token from any text borrowed from another error. */
+function redactToken(text: string, token: string): string {
+  return token ? text.split(token).join("[redacted-token]") : text;
+}
+
+interface TelegramResponseBody {
+  ok?: boolean;
+  description?: string;
+  parameters?: { retry_after?: unknown };
+  result?: unknown;
+}
+
+function retryAfterSeconds(body: TelegramResponseBody | undefined, response: Response): number | undefined {
+  const fromBody = body?.parameters?.retry_after;
+  if (typeof fromBody === "number" && Number.isFinite(fromBody) && fromBody >= 0) return fromBody;
+  const header = Number.parseInt(response.headers.get("retry-after") || "", 10);
+  return Number.isFinite(header) && header >= 0 ? header : undefined;
+}
+
+async function telegramRequest(
+  token: string,
+  method: string,
+  url: string,
+  init: RequestInit = {},
+): Promise<TelegramResponseBody> {
+  let response: Response;
+  try {
+    response = await fetch(url, init);
+  } catch (err) {
+    // NEVER rethrow the raw error: it carries the token-bearing request URL.
+    const aborted = Boolean(init.signal?.aborted);
+    const detail = redactToken(err instanceof Error ? err.message : String(err), token);
+    throw new TelegramApiError(
+      aborted ? `Telegram ${method} request aborted` : `Telegram ${method} request failed: ${detail}`,
+      { method, aborted },
+    );
+  }
+
+  const body = await response.json().catch(() => undefined) as TelegramResponseBody | undefined;
+  if (!response.ok || !body?.ok) {
+    const description = typeof body?.description === "string" ? body.description : undefined;
+    throw new TelegramApiError(
+      `Telegram ${method} failed (${response.status}): ${redactToken(description || "no description", token)}`,
+      { method, status: response.status, description, retryAfterSeconds: retryAfterSeconds(body, response) },
+    );
+  }
+  return body;
+}
+
 export async function sendTelegramMessage(token: string, chatId: string, text: string): Promise<unknown> {
-  const response = await fetch(telegramMethodUrl(token, "sendMessage"), {
+  return telegramRequest(token, "sendMessage", telegramMethodUrl(token, "sendMessage"), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text }),
   });
-  const body = await response.json().catch(() => undefined);
-  if (!response.ok) throw new Error(`Telegram sendMessage failed (${response.status}): ${JSON.stringify(body)}`);
-  return body;
+}
+
+/** A getUpdates entry is only usable if it carries the numeric update_id the offset depends on. */
+function isUsableUpdate(value: unknown): value is TelegramUpdate {
+  return Boolean(
+    value
+    && typeof value === "object"
+    && Number.isInteger((value as { update_id?: unknown }).update_id),
+  );
 }
 
 export async function getTelegramUpdates(
   token: string,
-  options: { offset?: number; timeoutSeconds?: number } = {},
+  options: { offset?: number; timeoutSeconds?: number; signal?: AbortSignal } = {},
 ): Promise<TelegramUpdate[]> {
   const params = new URLSearchParams();
   if (options.offset !== undefined) params.set("offset", String(options.offset));
   params.set("timeout", String(options.timeoutSeconds ?? 20));
-  const response = await fetch(`${telegramMethodUrl(token, "getUpdates")}?${params.toString()}`);
-  const body = await response.json().catch(() => undefined) as { ok?: boolean; result?: TelegramUpdate[] };
-  if (!response.ok || !body?.ok) {
-    throw new Error(`Telegram getUpdates failed (${response.status}): ${JSON.stringify(body)}`);
+  const init: RequestInit = options.signal ? { signal: options.signal } : {};
+  const body = await telegramRequest(
+    token,
+    "getUpdates",
+    `${telegramMethodUrl(token, "getUpdates")}?${params.toString()}`,
+    init,
+  );
+  if (!Array.isArray(body.result)) {
+    // A proxy or captive portal can answer 200/ok with a non-array result;
+    // iterating it throws deep in the poll loop instead of here.
+    throw new TelegramApiError("Telegram getUpdates returned a malformed result (expected an array)", {
+      method: "getUpdates",
+    });
   }
-  return body.result || [];
+  // Drop entries without a numeric update_id: the poll offset is derived from
+  // it, and `undefined + 1` would persist NaN and permanently break the cursor.
+  return body.result.filter(isUsableUpdate);
 }
 
 export function telegramUpdateToMessage(channelId: string, update: TelegramUpdate): BridgeMessage | undefined {

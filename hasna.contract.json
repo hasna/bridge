@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "name": "@hasna/bridge",
+  "type": "npm-package",
+  "runtime": "bun",
+  "waivers": {
+    "storage": {
+      "reason": "The bridge persists user-owned configuration, session state, and daemon metadata locally.",
+      "paths": [
+        "~/.hasna/bridge"
+      ]
+    }
+  }
+}

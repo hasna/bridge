@@ -89,7 +89,9 @@ test("subprocess output is capped, retaining the head and the tail of the stream
 }, 20_000);
 
 test("a normal run still returns full output and the real exit code", async () => {
-  const ok = await spawnAgentProcess(["sh", "-lc", "echo out; echo err 1>&2; exit 0"], { timeoutMs: 10_000 });
+  // A login shell sources the host's profile and can add unrelated diagnostics
+  // to stderr, making this subprocess contract test depend on ambient dotfiles.
+  const ok = await spawnAgentProcess(["sh", "-c", "echo out; echo err 1>&2; exit 0"], { timeoutMs: 10_000 });
   expect(ok.exitCode).toBe(0);
   expect(ok.timedOut).toBe(false);
   expect(ok.stdout.trim()).toBe("out");

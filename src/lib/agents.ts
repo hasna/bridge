@@ -704,15 +704,24 @@ function releaseChildStreams(child: ChildProcess): void {
 const liveAgentPids = new Set<number>();
 let reaperInstalled = false;
 
-/** Signals the process group of every in-flight agent run. Synchronous. */
-function reapLiveAgents(signal: NodeJS.Signals): void {
-  for (const pid of liveAgentPids) {
+/** Signals the selected in-flight agent process groups. Synchronous. */
+function reapAgentPids(pids: Iterable<number>, signal: NodeJS.Signals): void {
+  for (const pid of pids) {
+    // A shutdown escalation must only affect runs that were live when that
+    // shutdown signal arrived, never a later run that happened to start during
+    // the grace window.
+    if (!liveAgentPids.has(pid)) continue;
     try {
       process.kill(-pid, signal);
     } catch {
       // Already gone.
     }
   }
+}
+
+/** Signals the process group of every in-flight agent run. Synchronous. */
+function reapLiveAgents(signal: NodeJS.Signals): void {
+  reapAgentPids(liveAgentPids, signal);
 }
 
 const REAPED_SIGNALS: NodeJS.Signals[] = ["SIGTERM", "SIGINT"];
@@ -731,8 +740,9 @@ const REAPED_SIGNALS: NodeJS.Signals[] = ["SIGTERM", "SIGINT"];
  *  - The signal is forwarded to the agent groups, so an in-flight run is
  *    actually shortened by a stop instead of running out its own (default 120s)
  *    budget while the daemon only waits 5s and then reports a failed stop.
- *  - `on` (not `once`), so a SECOND SIGTERM — systemd's shutdown escalation —
- *    is still handled rather than silently skipped.
+ *  - `prependListener` (not `once`), so one-shot shutdown handlers are still
+ *    visible when listener count is inspected and a SECOND SIGTERM — systemd's
+ *    shutdown escalation — is still handled rather than silently skipped.
  *  - Merely adding a signal listener suppresses Node's default termination, so
  *    when nothing else is listening the handler re-raises the signal to restore
  *    it. Otherwise a one-shot `bridge send` would stop dying on Ctrl-C.
@@ -752,13 +762,26 @@ function ensureAgentReaperInstalled(): void {
 
   for (const signal of REAPED_SIGNALS) {
     const handler = (): void => {
-      reapLiveAgents(signal);
+      const signalledPids = [...liveAgentPids];
+      reapAgentPids(signalledPids, signal);
+      // An agent may ignore the graceful signal. Escalate only the runs captured
+      // above, before a force-stop can SIGKILL the station and remove the timer
+      // that enforces each run's normal timeout.
+      const escalation = setTimeout(
+        () => reapAgentPids(signalledPids, "SIGKILL"),
+        AGENT_KILL_GRACE_MS,
+      );
+      escalation.unref();
       if (process.listenerCount(signal) <= 1) {
         process.removeListener(signal, handler);
         process.kill(process.pid, signal);
       }
     };
-    process.on(signal, handler);
+    // Run before a host's `once` handler removes itself. With `on`, serve's
+    // earlier one-shot stop handler disappeared before this count and the reaper
+    // mistook itself for the only listener, re-raising SIGTERM and skipping the
+    // graceful state-persistence path.
+    process.prependListener(signal, handler);
   }
 }
 

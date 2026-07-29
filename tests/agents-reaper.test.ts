@@ -176,3 +176,55 @@ setInterval(() => {}, 1000);
     await rm(dir, { recursive: true, force: true });
   }
 }, 60_000);
+
+/**
+ * `serve` registers its graceful stop listener with `once` before it starts an
+ * agent. EventEmitter removes a one-shot listener immediately before invoking
+ * it, so a reaper that runs afterwards sees only itself and re-raises SIGTERM,
+ * killing serve before it can finish the turn and persist state. The reaper must
+ * run first, leave the host alive, and still hard-kill an agent that ignores the
+ * forwarded SIGTERM.
+ */
+test("a one-shot host shutdown handler stays graceful and a TERM-ignoring agent is escalated", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-reaper-"));
+  let host: ReturnType<typeof Bun.spawn> | undefined;
+  let agent = 0;
+  try {
+    const indexPath = join(import.meta.dir, "..", "src", "index.ts");
+    const scriptPath = join(dir, "graceful.ts");
+    await writeFile(scriptPath, `
+import { writeFileSync } from "node:fs";
+import { spawnAgentProcess } from ${JSON.stringify(indexPath)};
+
+process.once("SIGTERM", () => writeFileSync("${dir}/handled", "1"));
+void spawnAgentProcess(
+  ["sh", "-lc", "echo $$ > ${dir}/agent.pid; trap '' TERM; sleep 60"],
+  { timeoutMs: 60000, killGraceMs: 300 },
+).then(() => writeFileSync("${dir}/returned", "1")).catch(() => undefined);
+setTimeout(() => writeFileSync("${dir}/ready", "1"), 400);
+setInterval(() => {}, 1000);
+`);
+
+    host = Bun.spawn(["bun", "run", scriptPath], { stdout: "pipe", stderr: "pipe" });
+    await waitFor("TERM-ignoring agent to start", () => existsSync(join(dir, "ready")));
+    agent = await readPid(join(dir, "agent.pid"));
+    expect(pidAlive(agent)).toBe(true);
+
+    process.kill(host.pid, "SIGTERM");
+    await waitFor("one-shot shutdown handler", () => existsSync(join(dir, "handled")));
+    expect(pidAlive(host.pid)).toBe(true);
+    await waitFor("TERM-ignoring agent escalation", () => !pidAlive(agent));
+    await waitFor("agent run to return after escalation", () => existsSync(join(dir, "returned")));
+    expect(pidAlive(host.pid)).toBe(true);
+  } finally {
+    if (agent) {
+      try {
+        process.kill(-agent, "SIGKILL");
+      } catch {
+        // already reaped
+      }
+    }
+    host?.kill(9);
+    await rm(dir, { recursive: true, force: true });
+  }
+}, 60_000);

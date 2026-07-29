@@ -35,19 +35,40 @@ async function privateDirCheck(name: string, path: string): Promise<DoctorCheck>
   }
 }
 
-async function commandExists(command: string): Promise<boolean> {
-  const proc = Bun.spawn(["sh", "-lc", `command -v ${command} >/dev/null 2>&1`], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  return (await proc.exited) === 0;
+/**
+ * Resolve against this process's PATH, the same way the agent runner spawns
+ * commands. The previous implementation used a *login* shell (`sh -lc`), which
+ * re-sources the user's profile and therefore answered for a PATH the bridge
+ * process does not have — reporting `ok` for a runtime that a launchd/systemd
+ * managed daemon, with its minimal environment, cannot actually execute.
+ */
+function commandExists(command: string): boolean {
+  // PATH is passed explicitly: Bun.which() otherwise resolves against the PATH
+  // captured at process start, not the one the agent runner will spawn with.
+  return Bun.which(command, { PATH: process.env["PATH"] ?? "" }) !== null;
 }
 
-export async function doctor(configPath = defaultConfigPath(), statePath = defaultStatePath()): Promise<DoctorReport> {
+export interface DoctorOptions {
+  /** Daemon metadata/log directory to inspect. Defaults to the standard one. */
+  daemonDir?: string;
+}
+
+/**
+ * Agent runtimes bridge shells out to. A missing binary only breaks this
+ * installation when an agent is actually configured to use that runtime and has
+ * no explicit command of its own, so the check is a warning otherwise.
+ */
+const OPTIONAL_AGENT_RUNTIMES = ["codewith", "claude", "aicopilot"] as const;
+
+export async function doctor(
+  configPath = defaultConfigPath(),
+  statePath = defaultStatePath(),
+  options: DoctorOptions = {},
+): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
   const config = await loadConfig(configPath);
-  const daemon = await daemonStatus();
-  const paths = daemonPaths();
+  const paths = daemonPaths(options.daemonDir);
+  const daemon = await daemonStatus({ daemonDir: paths.dir });
 
   checks.push(await privateFileCheck("config", configPath));
   checks.push(await privateFileCheck("state", statePath));
@@ -55,8 +76,18 @@ export async function doctor(configPath = defaultConfigPath(), statePath = defau
   checks.push(await privateFileCheck("daemon-metadata", paths.metadataFile));
   checks.push({
     name: "daemon-status",
+    // Stale metadata is reaped by `daemonStatus`, so it is only still reported
+    // when reaping was blocked by a concurrent daemon operation — transient, and
+    // not a reason to fail a health gate.
     ok: !daemon.stale,
-    detail: daemon.running ? `running pid=${daemon.pid}` : daemon.stale ? `stale pid=${daemon.pid}` : "not running",
+    severity: "warn",
+    detail: daemon.running
+      ? `running pid=${daemon.pid}`
+      : daemon.stale
+        ? `stale pid=${daemon.pid}: ${daemon.detail}`
+        : daemon.reaped
+          ? `not running; ${daemon.detail}`
+          : "not running",
   });
 
   try {
@@ -74,20 +105,33 @@ export async function doctor(configPath = defaultConfigPath(), statePath = defau
     });
   }
 
-  for (const command of ["bridge", "codewith", "claude", "aicopilot"]) {
+  checks.push({ name: "command:bridge", ok: true, detail: "current package" });
+  for (const runtime of OPTIONAL_AGENT_RUNTIMES) {
+    const dependants = Object.values(config.agents).filter((agent) => {
+      if (agent.kind !== runtime) return false;
+      // An agent with an explicit command never invokes the runtime binary.
+      return !(agent.command || (agent.profileId && config.profiles[agent.profileId]?.command));
+    });
+    const required = dependants.length > 0;
     checks.push({
-      name: `command:${command}`,
-      ok: command === "bridge" ? true : await commandExists(command),
-      detail: command === "bridge" ? "current package" : undefined,
+      name: `command:${runtime}`,
+      ok: commandExists(runtime),
+      severity: required ? "error" : "warn",
+      detail: required
+        ? `required by agent(s): ${dependants.map((agent) => agent.id).join(", ")}`
+        : "optional; no configured agent uses this runtime",
     });
   }
 
   const telegramChannels = Object.values(config.channels).filter((channel) => channel.kind === "telegram");
   for (const channel of telegramChannels) {
     const envName = channel.botTokenEnv || "TELEGRAM_BOT_TOKEN";
+    // No token means this channel cannot receive or send at all: a hard failure,
+    // even though the process may still be "running".
     checks.push({
       name: `telegram-token:${channel.id}`,
       ok: Boolean(process.env[envName]),
+      severity: "error",
       detail: envName,
     });
     checks.push({
@@ -134,5 +178,7 @@ export async function doctor(configPath = defaultConfigPath(), statePath = defau
     checks.push(...await diagnoseIMessage(channel));
   }
 
-  return { ok: checks.every((check) => check.ok), configPath, checks };
+  // `ok` gates CI and scripts: only error-severity failures make the bridge
+  // unhealthy. Warnings are still reported with `ok: false` on the check itself.
+  return { ok: checks.every((check) => check.ok || check.severity === "warn"), configPath, checks };
 }

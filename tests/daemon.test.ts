@@ -130,7 +130,9 @@ test("doctor reports invalid Telegram API base override", async () => {
   await saveConfig(testConfig(), configPath);
   process.env["BRIDGE_TELEGRAM_API_BASE"] = "file:///tmp/telegram";
 
-  const report = await doctor(configPath, join(dir, "state.json"));
+  // Explicit daemonDir keeps the check off the developer's real daemon
+  // directory, which `daemonStatus` now reaps stale metadata from.
+  const report = await doctor(configPath, join(dir, "state.json"), { daemonDir: join(dir, "daemon") });
   const check = report.checks.find((item) => item.name === "telegram-api-base");
   expect(check?.ok).toBe(false);
   expect(check?.detail).toContain("must use http or https");

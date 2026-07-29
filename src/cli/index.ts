@@ -257,16 +257,21 @@ program
   .command("doctor")
   .description("Validate local bridge setup")
   .option("-c, --config <path>", "config path", defaultConfigPath())
+  .option("-s, --state <path>", "state path")
+  .option("--daemon-dir <path>", "daemon metadata/log directory")
   .option("--json", "output JSON")
   .action(async (options) => {
-    const report = await doctor(options.config);
+    const report = await doctor(options.config, options.state, { daemonDir: options.daemonDir });
     if (options.json) asJson(report);
     else {
       for (const check of report.checks) {
-        console.log(`${check.ok ? "ok" : "fail"} ${check.name}${check.detail ? ` - ${check.detail}` : ""}`);
+        const label = check.ok ? "ok" : check.severity === "warn" ? "warn" : "fail";
+        console.log(`${label} ${check.name}${check.detail ? ` - ${check.detail}` : ""}`);
       }
-      process.exitCode = report.ok ? 0 : 1;
     }
+    // Exit non-zero on any error-severity failure in both output modes so CI and
+    // shell scripts can gate on bridge health.
+    process.exitCode = report.ok ? 0 : 1;
   });
 
 const configCommand = program.command("config").description("Inspect bridge config");

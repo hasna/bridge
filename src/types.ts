@@ -301,9 +301,17 @@ export interface DoctorCheck {
   name: string;
   ok: boolean;
   detail?: string;
+  /**
+   * How a failing check should be treated. `error` (the default when omitted)
+   * means the bridge is unhealthy and `DoctorReport.ok` becomes false; `warn`
+   * means the check failed but does not by itself break this installation, so
+   * it is reported without failing the report.
+   */
+  severity?: "error" | "warn";
 }
 
 export interface DoctorReport {
+  /** True when no `error`-severity check failed. Failing `warn` checks may exist. */
   ok: boolean;
   configPath: string;
   checks: DoctorCheck[];

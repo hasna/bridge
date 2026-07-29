@@ -127,3 +127,62 @@ test("serve stops promptly on SIGTERM even while blocked in a long poll", async 
     server.stop(true);
   }
 }, 30_000);
+
+test("a second signal force-exits serve while an agent run is still in flight", async () => {
+  // The first signal cannot interrupt an in-flight agent run (a codewith turn can
+  // take minutes), so a repeated Ctrl-C / SIGTERM must remain an escape hatch.
+  const update = {
+    update_id: 500,
+    message: { message_id: 1, text: "hang", chat: { id: 1, type: "private" }, date: 0 },
+  };
+  const server = Bun.serve({
+    port: 0,
+    fetch(request) {
+      if (new URL(request.url).pathname.endsWith("/getUpdates")) {
+        return Response.json({ ok: true, result: [update] });
+      }
+      return Response.json({ ok: true, result: {} });
+    },
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), "bridge-serve-force-"));
+  const configPath = join(dir, "config.json");
+  const statePath = join(dir, "state.json");
+  const hanging: BridgeConfig = {
+    version: 1,
+    channels: {
+      alpha: {
+        id: "alpha", kind: "telegram", enabled: true, botTokenEnv: "ALPHA_TG_TOKEN",
+        allowedChatIds: ["1"], defaultAgentId: "sleeper",
+      },
+    },
+    profiles: {},
+    // Explicit cwd keeps the run hermetic (no real workspace provisioning).
+    agents: { sleeper: { id: "sleeper", kind: "shell", command: "sh", args: ["-c", "sleep 120", "{prompt}"], cwd: tmpdir() } },
+    routes: [],
+  };
+  await saveConfig(hanging, configPath);
+
+  const proc = spawnCli(
+    ["serve", "--interval", "50", "--config", configPath, "--state", statePath],
+    { ALPHA_TG_TOKEN: "token-a", BRIDGE_TELEGRAM_API_BASE: `http://127.0.0.1:${server.port}` },
+  );
+
+  try {
+    // Give the poll loop time to pick up the update and start the sleeping agent.
+    await Bun.sleep(2500);
+    proc.kill("SIGTERM");
+    await Bun.sleep(500);
+    const started = Date.now();
+    proc.kill("SIGTERM");
+    const killTimer = setTimeout(() => proc.kill("SIGKILL"), 10_000);
+    const result = await collect(proc);
+    clearTimeout(killTimer);
+
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("forced shutdown");
+  } finally {
+    server.stop(true);
+  }
+}, 30_000);

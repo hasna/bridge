@@ -28,7 +28,7 @@ import {
   stopProcessDaemon,
   uninstallDaemon,
   getTelegramUpdates,
-  getIMessageMessages,
+  getIMessageMessagePage,
   imessageHandleAllowed,
   imessageRowToMessage,
   sendIMessage,
@@ -158,6 +158,15 @@ async function runServe(options: { once?: boolean; interval?: string; json?: boo
         console.error(`[bridge] dead-letter notice failed for ${entry.id}: ${err instanceof Error ? err.message : String(err)}`);
       }
     },
+    // The agent answered but the reply could not be sent. There is no point
+    // notifying the sender over the transport that is failing, so this is an
+    // operator signal only; the reply stays in the ledger, redeliverable.
+    onDeliveryExhausted: (_message: BridgeMessage, entry: MessageLedgerEntry) => {
+      console.error(
+        `[bridge] undelivered reply for ${entry.id} after ${entry.deliveryAttempts} delivery attempt(s):`
+        + ` ${entry.error || "unknown error"} — the agent answer is retained in the ledger`,
+      );
+    },
   };
 
   const errorCounts = new Map<string, number>();
@@ -168,8 +177,15 @@ async function runServe(options: { once?: boolean; interval?: string; json?: boo
   // timeout, and left Ctrl-C looking frozen.
   const shutdown = new AbortController();
   const sleepers = new Set<() => void>();
+  let stopSignals = 0;
   const stop = () => {
-    if (stopping) return;
+    stopSignals += 1;
+    if (stopSignals > 1) {
+      // A graceful stop cannot interrupt an in-flight agent run (a codewith turn
+      // can take minutes), so a repeated Ctrl-C / SIGTERM stays an escape hatch.
+      console.error("[bridge] forced shutdown");
+      process.exit(130);
+    }
     stopping = true;
     shutdown.abort();
     for (const wake of [...sleepers]) wake();
@@ -244,13 +260,17 @@ async function runServe(options: { once?: boolean; interval?: string; json?: boo
         try {
           const pollState = await loadState(statePath);
           const cursorKey = `imessage:${channel.id}`;
-          const rows = getIMessageMessages(channel, {
+          const page = getIMessageMessagePage(channel, {
             afterRowId: Number(pollState.cursors[cursorKey] || 0),
             limit: channel.pollLimit || 50,
           });
           errorCounts.delete(channel.id);
-          for (const row of rows) {
-            if (stopping) break;
+          let interrupted = false;
+          for (const row of page.rows) {
+            if (stopping) {
+              interrupted = true;
+              break;
+            }
             const state = await loadState(statePath);
             const message = imessageRowToMessage(channel.id, row);
             const outcome = await handleInboundMessage(config, state, message, dispatchOptions);
@@ -261,6 +281,15 @@ async function runServe(options: { once?: boolean; interval?: string; json?: boo
             } else {
               await saveState(state, statePath);
               throw new Error(outcome.error || `Message ${message.id} did not reach a terminal state`);
+            }
+          }
+          // Step the cursor past rows the filters rejected, so a scan window with
+          // nothing deliverable in it cannot block every later message.
+          if (!interrupted && page.scannedThroughRowId !== undefined) {
+            const state = await loadState(statePath);
+            if (Number(state.cursors[cursorKey] || 0) < page.scannedThroughRowId) {
+              state.cursors[cursorKey] = page.scannedThroughRowId;
+              await saveState(state, statePath);
             }
           }
         } catch (err) {
@@ -687,6 +716,9 @@ program
     if (channel.kind === "telegram") {
       targetChat = targetChat || channel.defaultChatId;
       if (!targetChat) throw new Error("chatId argument or channel.defaultChatId is required");
+      // Matches the iMessage branch: reject locally instead of spending an API
+      // call on a message Telegram will refuse anyway.
+      if (!text.trim()) throw new Error("message text is required");
       if (!channel.allowAllChats && !channel.allowedChatIds?.includes(targetChat)) {
         throw new Error(`Telegram chat ${targetChat} is not in channel allowedChatIds`);
       }

@@ -141,3 +141,16 @@ test("sessions send still exits zero on a successful delivery", async () => {
   expect(sent.exitCode).toBe(0);
   expect(sent.stdout).toContain("reply:hello");
 });
+
+test("send refuses an empty message instead of calling the Telegram API", async () => {
+  const { configPath } = await withConfig();
+  const result = await runCli(
+    ["send", "tg", "1", "--config", configPath],
+    { CLI_ERRORS_TG_TOKEN: "token", BRIDGE_TELEGRAM_API_BASE: "http://127.0.0.1:1" },
+  );
+
+  expect(result.exitCode).toBe(1);
+  expect(result.stderr).toContain("message text is required");
+  // Nothing was attempted over the network.
+  expect(result.stderr).not.toContain("Unable to connect");
+});

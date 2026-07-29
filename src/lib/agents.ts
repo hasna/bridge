@@ -875,6 +875,22 @@ async function runCodewithProfileTurn(
  * one was gone/expired. That is the one case where callers must honestly tell the
  * user their prior context did not carry over.
  */
+/**
+ * Best-effort usage probe. It is an OPTIMISATION backed by an external CLI
+ * (`codewith usage`), so a failure — CLI missing, network blip, timeout — must
+ * mean "unknown" and let the profile run. Awaiting it unguarded let a probe
+ * rejection propagate out of {@link runAgent} and fail the user's message even
+ * though every billing account was healthy.
+ */
+async function probeUsageExhausted(deps: RunAgentDeps, authProfile: string): Promise<boolean> {
+  if (!deps.checkUsageExhausted) return false;
+  try {
+    return Boolean(await deps.checkUsageExhausted(authProfile));
+  } catch {
+    return false;
+  }
+}
+
 async function runCodewithDurable(
   config: BridgeConfig,
   agent: AgentConfig,
@@ -894,15 +910,18 @@ async function runCodewithDurable(
     // Proactively skip a profile a usage probe already reports as exhausted, so
     // rotation prefers a profile with remaining usage rather than burning a
     // doomed request. Never skip the last remaining candidate.
-    if (deps.checkUsageExhausted && authProfile && i < candidates.length - 1) {
-      if (await deps.checkUsageExhausted(authProfile)) continue;
+    if (authProfile && i < candidates.length - 1) {
+      if (await probeUsageExhausted(deps, authProfile)) continue;
     }
     const result = await runCodewithProfileTurn(config, agent, candidate, input, deps);
     result.rotated = i > 0;
     // Rotation resumes the SAME shared thread under the new billing account, so
     // context is preserved — no reset. Only a genuine stale-thread self-heal
-    // (the stored thread was gone and a fresh one had to be started) drops it.
-    if (result.staleSessionHealed) result.contextReset = true;
+    // (the stored thread was gone and a fresh one had to be started) drops it —
+    // and only when that fresh thread actually WORKED. A heal whose retry also
+    // failed produced no new thread and no reply, so reporting a context reset
+    // there would misdescribe what happened to the conversation.
+    if (result.staleSessionHealed && !result.timedOut && result.exitCode === 0) result.contextReset = true;
     last = result;
     if (!result.exhausted) break;
     // Exhausted: fall through to the next candidate profile (if any).
@@ -953,11 +972,24 @@ export async function runAgent(
  * and shared across billing accounts, not keyed per profile. `authProfile` merely
  * records which account last paid, so the next turn starts on a profile that was
  * working. Returns true when the ref changed.
+ *
+ * A run that PROVED the stored thread is gone (stale-session self-heal) but
+ * produced no replacement id also changes the ref: the dead pointer is dropped.
+ * Keeping it pinned made every later message in the conversation pay a wasted
+ * `codewith exec resume <dead-id>` spawn before the real one — forever — and
+ * re-show the user the "I started a new session" note on every successful heal.
  */
 export function recordDurableSession(session: BridgeSession, agent: AgentRunResult): boolean {
-  if (!agent.providerSessionId) return false;
   const ref = session.agentSession;
   if (!ref || ref.mode !== "durable") return false;
+  if (!agent.providerSessionId) {
+    if (agent.staleSessionHealed && ref.refId !== undefined) {
+      delete ref.refId;
+      ref.updatedAt = new Date().toISOString();
+      return true;
+    }
+    return false;
+  }
   const changed = ref.refId !== agent.providerSessionId
     || (Boolean(agent.authProfile) && ref.authProfile !== agent.authProfile);
   ref.refId = agent.providerSessionId;

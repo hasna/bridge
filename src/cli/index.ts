@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
+import { ZodError } from "zod";
 import {
   ensureConfig,
   loadConfig,
@@ -46,7 +47,10 @@ import {
   notifyDeadLetter,
   reconcileInFlight,
   upsertAgentWorkspace,
+  assertTelegramTokensConfigured,
+  pollBackoffMs,
   DEFAULT_MAX_ATTEMPTS,
+  TelegramApiError,
   getBridgeSession,
   getBroadcast,
   listBridgeSessions,
@@ -116,6 +120,10 @@ async function runServe(options: { once?: boolean; interval?: string; json?: boo
   const intervalMs = parseNonNegativeInt(options.interval || "1000", "--interval");
   const maxAttempts = options.maxAttempts ? parseNonNegativeInt(options.maxAttempts, "--max-attempts") || DEFAULT_MAX_ATTEMPTS : DEFAULT_MAX_ATTEMPTS;
   if (!telegramChannels.length && !imessageChannels.length) throw new Error("No enabled pollable channels configured");
+  // A missing bot token can never be fixed while this process runs, so refuse to
+  // start rather than log the same unrecoverable error on every backoff cycle.
+  // (`bridge daemon start` already preflights this; foreground serve did not.)
+  assertTelegramTokensConfigured(config);
 
   const statePath = options.state || defaultStatePath();
 
@@ -154,85 +162,119 @@ async function runServe(options: { once?: boolean; interval?: string; json?: boo
 
   const errorCounts = new Map<string, number>();
   let stopping = false;
+  // Shutdown must interrupt whatever the loop is currently blocked on: a
+  // getUpdates long poll (up to 50s) or a backoff sleep (up to 5min). Setting a
+  // flag alone made `bridge daemon stop` / systemctl stop hit their SIGTERM
+  // timeout, and left Ctrl-C looking frozen.
+  const shutdown = new AbortController();
+  const sleepers = new Set<() => void>();
   const stop = () => {
+    if (stopping) return;
     stopping = true;
+    shutdown.abort();
+    for (const wake of [...sleepers]) wake();
   };
-  process.once("SIGTERM", stop);
-  process.once("SIGINT", stop);
-  while (!stopping) {
-    for (const channel of telegramChannels) {
-      try {
-        const pollState = await loadState(statePath);
-        const updates = await getTelegramUpdates(telegramToken(channel), {
-          offset: pollState.telegramOffsets[channel.id],
-          timeoutSeconds: channel.pollTimeoutSeconds || 20,
-        });
-        errorCounts.delete(channel.id);
-        for (const update of updates) {
-          if (stopping) break;
-          const state = await loadState(statePath);
-          const message = telegramUpdateToMessage(channel.id, update);
-          if (!message) {
-            state.telegramOffsets[channel.id] = update.update_id + 1;
-            await saveState(state, statePath);
-            continue;
+  const sleep = async (ms: number): Promise<void> => {
+    if (stopping || ms <= 0) return;
+    await new Promise<void>((resolve) => {
+      const wake = () => {
+        clearTimeout(timer);
+        sleepers.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, ms);
+      sleepers.add(wake);
+    });
+  };
+  const onPollError = async (channelId: string, err: unknown): Promise<void> => {
+    if (stopping) return;
+    const count = (errorCounts.get(channelId) || 0) + 1;
+    errorCounts.set(channelId, count);
+    const message = err instanceof Error ? err.message : String(err);
+    const retryAfterSeconds = err instanceof TelegramApiError ? err.retryAfterSeconds : undefined;
+    const backoff = pollBackoffMs({ attempt: count, intervalMs, retryAfterSeconds });
+    console.error(
+      `[bridge] ${channelId} poll failed (${count}): ${message}`
+      + (retryAfterSeconds !== undefined ? ` (Telegram asked for ${retryAfterSeconds}s)` : "")
+      + ` — retrying in ${Math.round(backoff / 1000)}s`,
+    );
+    await sleep(backoff);
+  };
+
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
+  try {
+    while (!stopping) {
+      for (const channel of telegramChannels) {
+        if (stopping) break;
+        try {
+          const pollState = await loadState(statePath);
+          const updates = await getTelegramUpdates(telegramToken(channel), {
+            offset: pollState.telegramOffsets[channel.id],
+            timeoutSeconds: channel.pollTimeoutSeconds || 20,
+            signal: shutdown.signal,
+          });
+          errorCounts.delete(channel.id);
+          for (const update of updates) {
+            if (stopping) break;
+            const state = await loadState(statePath);
+            const message = telegramUpdateToMessage(channel.id, update);
+            if (!message) {
+              state.telegramOffsets[channel.id] = update.update_id + 1;
+              await saveState(state, statePath);
+              continue;
+            }
+            const outcome = await handleInboundMessage(config, state, message, dispatchOptions);
+            if (outcome.advanceOffset) {
+              state.telegramOffsets[channel.id] = update.update_id + 1;
+              await saveState(state, statePath);
+              if (options.json) asJson(outcome.result);
+            } else {
+              await saveState(state, statePath);
+              throw new Error(outcome.error || `Message ${message.id} did not reach a terminal state`);
+            }
           }
-          const outcome = await handleInboundMessage(config, state, message, dispatchOptions);
-          if (outcome.advanceOffset) {
-            state.telegramOffsets[channel.id] = update.update_id + 1;
-            await saveState(state, statePath);
-            if (options.json) asJson(outcome.result);
-          } else {
-            await saveState(state, statePath);
-            throw new Error(outcome.error || `Message ${message.id} did not reach a terminal state`);
-          }
+        } catch (err) {
+          if (options.once) throw err;
+          await onPollError(channel.id, err);
         }
-      } catch (err) {
-        if (options.once) throw err;
-        const count = (errorCounts.get(channel.id) || 0) + 1;
-        errorCounts.set(channel.id, count);
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(`[bridge] ${channel.id} poll failed (${count}): ${message}`);
-        await Bun.sleep(Math.min(30_000, Math.max(1000, intervalMs * Math.min(count, 30))));
       }
-    }
-    for (const channel of imessageChannels) {
-      try {
-        const pollState = await loadState(statePath);
-        const cursorKey = `imessage:${channel.id}`;
-        const rows = getIMessageMessages(channel, {
-          afterRowId: Number(pollState.cursors[cursorKey] || 0),
-          limit: channel.pollLimit || 50,
-        });
-        errorCounts.delete(channel.id);
-        for (const row of rows) {
-          if (stopping) break;
-          const state = await loadState(statePath);
-          const message = imessageRowToMessage(channel.id, row);
-          const outcome = await handleInboundMessage(config, state, message, dispatchOptions);
-          if (outcome.advanceOffset) {
-            state.cursors[cursorKey] = row.rowId;
-            await saveState(state, statePath);
-            if (options.json) asJson(outcome.result);
-          } else {
-            await saveState(state, statePath);
-            throw new Error(outcome.error || `Message ${message.id} did not reach a terminal state`);
+      for (const channel of imessageChannels) {
+        if (stopping) break;
+        try {
+          const pollState = await loadState(statePath);
+          const cursorKey = `imessage:${channel.id}`;
+          const rows = getIMessageMessages(channel, {
+            afterRowId: Number(pollState.cursors[cursorKey] || 0),
+            limit: channel.pollLimit || 50,
+          });
+          errorCounts.delete(channel.id);
+          for (const row of rows) {
+            if (stopping) break;
+            const state = await loadState(statePath);
+            const message = imessageRowToMessage(channel.id, row);
+            const outcome = await handleInboundMessage(config, state, message, dispatchOptions);
+            if (outcome.advanceOffset) {
+              state.cursors[cursorKey] = row.rowId;
+              await saveState(state, statePath);
+              if (options.json) asJson(outcome.result);
+            } else {
+              await saveState(state, statePath);
+              throw new Error(outcome.error || `Message ${message.id} did not reach a terminal state`);
+            }
           }
+        } catch (err) {
+          if (options.once) throw err;
+          await onPollError(channel.id, err);
         }
-      } catch (err) {
-        if (options.once) throw err;
-        const count = (errorCounts.get(channel.id) || 0) + 1;
-        errorCounts.set(channel.id, count);
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(`[bridge] ${channel.id} poll failed (${count}): ${message}`);
-        await Bun.sleep(Math.min(30_000, Math.max(1000, intervalMs * Math.min(count, 30))));
       }
+      if (options.once) break;
+      await sleep(intervalMs);
     }
-    if (options.once) break;
-    await Bun.sleep(intervalMs);
+  } finally {
+    process.removeListener("SIGTERM", stop);
+    process.removeListener("SIGINT", stop);
   }
-  process.removeListener("SIGTERM", stop);
-  process.removeListener("SIGINT", stop);
 }
 
 const program = new Command();
@@ -265,8 +307,10 @@ program
       for (const check of report.checks) {
         console.log(`${check.ok ? "ok" : "fail"} ${check.name}${check.detail ? ` - ${check.detail}` : ""}`);
       }
-      process.exitCode = report.ok ? 0 : 1;
     }
+    // Outside the branch: `--json` used to always exit 0, so CI and scripts
+    // could never detect a failing check.
+    process.exitCode = report.ok ? 0 : 1;
   });
 
 const configCommand = program.command("config").description("Inspect bridge config");
@@ -586,7 +630,10 @@ sessions
     await saveState(state, options.state);
     if (options.json) asJson(result);
     else process.stdout.write(result.agent?.stdout || result.agent?.stderr || result.message || "");
-    process.exitCode = result.agent?.exitCode ?? 0;
+    // A paused/closed/failed send produces no agent result; `?? 0` used to
+    // report success for those, so scripts could not tell delivery from failure.
+    const delivered = result.status === "delivered" || result.status === "no_output";
+    process.exitCode = delivered ? (result.agent?.exitCode ?? 0) : (result.agent?.exitCode || 1);
   });
 sessions
   .command("route-message")
@@ -891,15 +938,18 @@ program
 program
   .command("broadcast")
   .argument("<channelId>", "channel to broadcast on (telegram or console)")
-  .argument("<text>", "message text to post to every target")
+  // Variadic like `send` and `ask`: unquoted multi-word text used to be rejected
+  // with "too many arguments" instead of being broadcast.
+  .argument("<text...>", "message text to post to every target")
   .description("Broadcast a message to a channel's outbound targets and report per-post delivery status")
   .option("--targets <ids>", "comma-separated target chat ids (defaults to the channel's broadcastChatIds)")
   .option("--no-record", "do not persist the delivery report in state")
   .option("-c, --config <path>", "config path", defaultConfigPath())
   .option("--state <path>", "state path", defaultStatePath())
   .option("--json", "output JSON")
-  .action(async (channelId, text, options) => {
+  .action(async (channelId, textParts, options) => {
     const config = await loadConfig(options.config);
+    const text = (textParts as string[]).join(" ");
     const result = await broadcast(config, channelId, text, {
       targets: splitCsv(options.targets),
       writeConsole: options.json ? false : undefined,
@@ -948,4 +998,37 @@ broadcasts
     asJson(report);
   });
 
-await program.parseAsync(process.argv);
+/**
+ * Turn a thrown value into the one-line message a terminal user should see.
+ * Without this, every failure (a typo'd channel id, a refused connection) was
+ * reported by Bun's uncaught-error printer, which dumps surrounding source code,
+ * a stack trace, and — critically — the error's own properties. Bun attaches the
+ * failed request URL to network errors, and for Telegram that URL embeds the bot
+ * token, so the raw printer leaked credentials to the terminal and to the daemon
+ * stderr log.
+ */
+function describeCliError(err: unknown): string {
+  if (err instanceof ZodError) {
+    return `invalid config: ${err.issues
+      .map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
+      .join("; ")}`;
+  }
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+function failCli(err: unknown): void {
+  console.error(`bridge: ${describeCliError(err)}`);
+  if (process.env["BRIDGE_DEBUG"] && err instanceof Error && err.stack) console.error(err.stack);
+  process.exitCode = 1;
+}
+
+// Commander handles its own parse errors (unknown option, missing argument) and
+// exits directly, so only action-handler failures reach here. Rejections from
+// anywhere else stay unhandled on purpose: those are real bugs and should crash
+// loudly rather than be swallowed into an exit code.
+try {
+  await program.parseAsync(process.argv);
+} catch (err) {
+  failCli(err);
+}

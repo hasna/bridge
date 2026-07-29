@@ -108,3 +108,45 @@ test("doctor fails existing weak state permissions", async () => {
   expect(report.ok).toBe(false);
   expect(report.checks.find((check) => check.name === "state")?.ok).toBe(false);
 });
+
+test("rejects a route textRegex that is not a valid regular expression", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-config-"));
+  const path = join(dir, "config.json");
+  await ensureConfig(path);
+
+  // Previously accepted, then thrown as a raw SyntaxError from inside
+  // matchingRoutes on every inbound message — which wedges the poll loop
+  // because the offset can never advance past the failing message.
+  const rejected = await upsertRoute(
+    { id: "bad", fromChannel: "tg", toAgent: "echo", enabled: true, match: { textRegex: "[[" } },
+    path,
+  ).catch((err) => err);
+  expect(rejected).toBeInstanceOf(Error);
+  expect(String(rejected.message)).toContain("textRegex");
+
+  const config = await loadConfig(path);
+  expect(config.routes).toHaveLength(0);
+
+  await upsertRoute(
+    { id: "good", fromChannel: "tg", toAgent: "echo", enabled: true, match: { textRegex: "^hi\\b" } },
+    path,
+  );
+  expect((await loadConfig(path)).routes).toHaveLength(1);
+});
+
+test("routes add surfaces an invalid regex as a clean CLI error", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-config-"));
+  const path = join(dir, "config.json");
+  await ensureConfig(path);
+
+  const proc = Bun.spawn([
+    "bun", "run", "src/cli/index.ts",
+    "routes", "add", "bad", "--from", "tg", "--to", "echo", "--text-regex", "[[", "--config", path,
+  ], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
+  const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+
+  expect(exitCode).toBe(1);
+  expect(stderr).toContain("textRegex");
+  expect(stderr).not.toContain("at <anonymous>");
+  expect((await loadConfig(path)).routes).toHaveLength(0);
+});

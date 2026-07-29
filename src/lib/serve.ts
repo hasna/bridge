@@ -1,4 +1,4 @@
-import type { BridgeConfig, BridgeMessage, MessageLedgerEntry } from "../types.js";
+import type { BridgeConfig, BridgeMessage, MessageLedgerEntry, TelegramChannelConfig } from "../types.js";
 import type { BridgeState } from "./state.js";
 import {
   dispatchMessageWithSessions,
@@ -15,6 +15,63 @@ import {
  * could ever be processed.
  */
 export const DEFAULT_MAX_ATTEMPTS = 5;
+
+export interface MissingTelegramToken {
+  channelId: string;
+  envVar: string;
+}
+
+/**
+ * Enabled Telegram channels whose bot-token env var is not set in this process.
+ *
+ * A missing token is a configuration error, not a transient one: the poller can
+ * never recover from it because the environment is fixed at spawn time. Callers
+ * use this to fail fast with an actionable message instead of retrying forever.
+ */
+export function missingTelegramTokenEnvVars(config: BridgeConfig): MissingTelegramToken[] {
+  return Object.values(config.channels)
+    .filter((channel): channel is TelegramChannelConfig => channel.kind === "telegram" && channel.enabled !== false)
+    .map((channel) => ({ channelId: channel.id, envVar: channel.botTokenEnv || "TELEGRAM_BOT_TOKEN" }))
+    .filter((item) => !process.env[item.envVar]);
+}
+
+/** Throws one clear error naming every channel and env var that must be set. */
+export function assertTelegramTokensConfigured(config: BridgeConfig): void {
+  const missing = missingTelegramTokenEnvVars(config);
+  if (!missing.length) return;
+  const lines = missing.map((item) => `  ${item.channelId}: set ${item.envVar}`);
+  throw new Error(
+    `Missing Telegram bot token${missing.length === 1 ? "" : "s"} for ${missing.length} enabled channel${missing.length === 1 ? "" : "s"}:\n`
+    + `${lines.join("\n")}\n`
+    + "Export the variable(s) in the environment that runs bridge, or disable the channel(s).",
+  );
+}
+
+export interface PollBackoffInput {
+  /** Consecutive failures for this channel, starting at 1. */
+  attempt: number;
+  /** Configured poll interval, used as the linear backoff step. */
+  intervalMs: number;
+  /** Telegram's 429 `retry_after`, when the provider told us how long to wait. */
+  retryAfterSeconds?: number;
+}
+
+export const MIN_POLL_BACKOFF_MS = 1000;
+export const MAX_POLL_BACKOFF_MS = 30_000;
+export const MAX_RETRY_AFTER_BACKOFF_MS = 300_000;
+
+/**
+ * Backoff for a failed poll. When Telegram answers 429 with `retry_after` we
+ * honour it — retrying sooner is what escalates a soft rate limit into a longer
+ * one — otherwise we step linearly up to a 30s ceiling.
+ */
+export function pollBackoffMs(input: PollBackoffInput): number {
+  if (input.retryAfterSeconds !== undefined && Number.isFinite(input.retryAfterSeconds)) {
+    return Math.min(MAX_RETRY_AFTER_BACKOFF_MS, Math.max(MIN_POLL_BACKOFF_MS, input.retryAfterSeconds * 1000));
+  }
+  const attempt = Math.min(Math.max(1, input.attempt), 30);
+  return Math.min(MAX_POLL_BACKOFF_MS, Math.max(MIN_POLL_BACKOFF_MS, input.intervalMs * attempt));
+}
 
 export interface HandleInboundOptions extends SessionMessageOptions {
   maxAttempts?: number;

@@ -1,0 +1,57 @@
+{
+  "schema": "hasna.service_contract.v1",
+  "name": "bridge",
+  "class": "cli-with-store",
+  "contractVersion": "v1",
+  "kitVersion": "0.8.5",
+  "description": "Agent messaging bridge for Telegram and other channels.",
+  "bins": [
+    "bridge",
+    "bridge-mcp"
+  ],
+  "hosting": [
+    "user-hosted"
+  ],
+  "serviceSurfaces": [
+    {
+      "name": "cli",
+      "kind": "cli",
+      "status": "supported",
+      "bin": "bridge",
+      "authMode": "local-only"
+    },
+    {
+      "name": "mcp",
+      "kind": "mcp",
+      "status": "supported",
+      "mcpBin": "bridge-mcp",
+      "authMode": "local-only"
+    }
+  ],
+  "storage": {
+    "mode": "sqlite",
+    "engines": [
+      "sqlite"
+    ],
+    "envPrefix": "HASNA_BRIDGE_",
+    "aliasEnvPrefix": "BRIDGE_",
+    "sqlitePath": "~/.hasna/bridge/bridge.db"
+  },
+  "metadata": {
+    "release": {
+      "artifactScan": {
+        "script": "artifact-scan"
+      }
+    },
+    "conformance": {
+      "waivedStorageEngines": [
+        {
+          "engine": "postgres",
+          "reason": "Single-operator local CLI: the bridge persists user-owned configuration, session state, and daemon metadata under ~/.hasna/bridge only.",
+          "reviewedBy": "platform-storage",
+          "expiresAt": "2027-01-01T00:00:00.000Z"
+        }
+      ]
+    }
+  }
+}

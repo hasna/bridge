@@ -209,6 +209,88 @@ test("stop waits out an in-flight agent run instead of failing at 5s", async () 
   }
 }, 60_000);
 
+test("daemon CLI stop uses the derived grace window when no timeout override is passed", async () => {
+  const update = {
+    update_id: 901,
+    message: { message_id: 1, text: "work", chat: { id: 1, type: "private" }, date: 0 },
+  };
+  let served = false;
+  const server = Bun.serve({
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/getUpdates")) {
+        const offset = Number(url.searchParams.get("offset") || "0");
+        const send = !served && offset <= 901;
+        served = served || send;
+        return Response.json({ ok: true, result: send ? [update] : [] });
+      }
+      if (url.pathname.endsWith("/sendMessage")) return Response.json({ ok: true, result: {} });
+      return Response.json({ ok: false }, { status: 404 });
+    },
+  });
+
+  const dir = await mkdtemp(join(tmpdir(), "bridge-stopcli-"));
+  const daemonDir = join(dir, "daemon");
+  daemonDirs.push(daemonDir);
+  const configPath = join(dir, "config.json");
+  const statePath = join(dir, "state.json");
+  const marker = join(dir, "agent-started");
+
+  const config: BridgeConfig = {
+    version: 1,
+    channels: {
+      tg: {
+        id: "tg",
+        kind: "telegram",
+        enabled: true,
+        botTokenEnv: "TG_TEST_TOKEN",
+        allowedChatIds: ["1"],
+        pollTimeoutSeconds: 1,
+        defaultAgentId: "slow",
+      },
+    },
+    profiles: {},
+    agents: {
+      slow: {
+        id: "slow",
+        kind: "shell",
+        command: "sh",
+        args: ["-lc", `trap '' TERM; : > ${marker}; sleep 7; printf done`],
+        cwd: tmpdir(),
+        timeoutMs: 20_000,
+      },
+    },
+    routes: [],
+  };
+  await saveConfig(config, configPath);
+
+  const env = { TG_TEST_TOKEN: "test-token", BRIDGE_TELEGRAM_API_BASE: `http://127.0.0.1:${server.port}` };
+
+  try {
+    const start = await runCli(
+      ["daemon", "start", "--daemon-dir", daemonDir, "--config", configPath, "--state", statePath, "--interval", "50", "--json"],
+      env,
+    );
+    expect(start.exitCode).toBe(0);
+
+    for (let i = 0; i < 100 && !(await Bun.file(marker).exists()); i++) await Bun.sleep(100);
+    expect(await Bun.file(marker).exists()).toBe(true);
+
+    const started = Date.now();
+    const stop = await runCli(["daemon", "stop", "--daemon-dir", daemonDir, "--json"], env);
+    const elapsed = Date.now() - started;
+    const status = JSON.parse(stop.stdout);
+
+    expect(stop.exitCode).toBe(0);
+    expect(status.running).toBe(false);
+    expect(await Bun.file(daemonPaths(daemonDir).metadataFile).exists()).toBe(false);
+    expect(elapsed).toBeGreaterThan(2_000);
+  } finally {
+    server.stop(true);
+  }
+}, 60_000);
+
 // The wide ceiling must be an upper bound, never a delay an idle daemon sits out.
 test("an idle daemon still stops in milliseconds despite a wide ceiling", async () => {
   const server = Bun.serve({ port: 0, fetch: () => Response.json({ ok: true, result: [] }) });
